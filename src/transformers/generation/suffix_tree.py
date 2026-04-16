@@ -334,3 +334,139 @@ class SuffixTree:
                 best = draft
 
         return best
+
+
+class SuffixDecodingCache:
+    """Persistent cache for suffix decoding across multiple generation calls.
+
+    Maintains a global suffix tree that accumulates response patterns from
+    completed requests, allowing future requests to draft from previously seen
+    token sequences. Each active request also gets a local suffix tree seeded
+    with its prompt tokens.
+
+    Usage::
+
+        cache = SuffixDecodingCache(max_depth=64, max_cached_requests=100)
+
+        for prompt in prompts:
+            ids = tokenizer.encode(prompt, return_tensors="pt")
+            output = model.generate(
+                ids,
+                suffix_decoding_num_tokens=10,
+                suffix_decoding_cache=cache,
+            )
+
+    Args:
+        max_depth: Maximum suffix tree depth for both local and global trees.
+        max_cached_requests: Maximum number of completed responses to keep in
+            the global cache. When exceeded, oldest responses are evicted.
+            Set to 0 to disable the global cache entirely (local-only mode).
+            Set to -1 for unlimited caching.
+    """
+
+    def __init__(self, max_depth: int = 64, max_cached_requests: int = -1):
+        self._max_depth = max_depth
+        self._max_cached_requests = max_cached_requests
+        self._global_tree = SuffixTree(max_depth=max_depth)
+        self._local_trees: dict[int, SuffixTree] = {}
+        self._next_seq_id = 1
+        self._cached_order: list[int] = []
+
+    def start_request(self, prompt_token_ids: list[int]) -> int:
+        """Start a new request, creating a local tree seeded with prompt tokens.
+
+        Args:
+            prompt_token_ids: The prompt tokens to seed the local tree with.
+
+        Returns:
+            A request ID to pass to subsequent calls.
+        """
+        req_id = self._next_seq_id
+        self._next_seq_id += 1
+
+        local_tree = SuffixTree(max_depth=self._max_depth)
+        local_tree.extend(0, prompt_token_ids)
+        self._local_trees[req_id] = local_tree
+
+        # Allocate a slot in the global cache if enabled
+        if self._max_cached_requests != 0:
+            self._evict_if_needed()
+            self._cached_order.append(req_id)
+
+        return req_id
+
+    def add_active_response(self, req_id: int, token_ids: list[int]) -> None:
+        """Append accepted output tokens to the local and global trees.
+
+        Only call this with verified (accepted) tokens, never speculative ones.
+
+        Args:
+            req_id: The request ID returned by :meth:`start_request`.
+            token_ids: Accepted output token IDs to append.
+        """
+        if req_id in self._local_trees:
+            self._local_trees[req_id].extend(0, token_ids)
+
+        if self._max_cached_requests != 0 and req_id in self._cached_order:
+            self._global_tree.extend(req_id, token_ids)
+
+    def speculate(
+        self,
+        req_id: int,
+        context: list[int],
+        max_spec_tokens: int,
+        min_token_prob: float = 0.1,
+        max_spec_factor: float = 3.0,
+        max_spec_offset: float = 5.0,
+    ) -> SuffixDecodingDraft:
+        """Run speculation against both local and global trees, return the best.
+
+        Args:
+            req_id: The request ID returned by :meth:`start_request`.
+            context: Recent token tail to match.
+            max_spec_tokens: Hard cap on speculated tokens.
+            min_token_prob: Minimum probability threshold.
+            max_spec_factor: Soft cap factor.
+            max_spec_offset: Soft cap offset.
+
+        Returns:
+            The highest-scoring draft from either tree.
+        """
+        spec_kwargs = {
+            "context": context,
+            "max_spec_tokens": max_spec_tokens,
+            "min_token_prob": min_token_prob,
+            "max_spec_factor": max_spec_factor,
+            "max_spec_offset": max_spec_offset,
+        }
+
+        best = SuffixDecodingDraft()
+
+        if req_id in self._local_trees:
+            local_draft = self._local_trees[req_id].speculate(**spec_kwargs)
+            if local_draft.score >= best.score:
+                best = local_draft
+
+        if self._max_cached_requests != 0:
+            global_draft = self._global_tree.speculate(**spec_kwargs)
+            if global_draft.score >= best.score:
+                best = global_draft
+
+        return best
+
+    def stop_request(self, req_id: int) -> None:
+        """End a request, removing its local tree but keeping global cache.
+
+        Args:
+            req_id: The request ID returned by :meth:`start_request`.
+        """
+        self._local_trees.pop(req_id, None)
+
+    def _evict_if_needed(self) -> None:
+        """Evict the oldest cached response if at capacity."""
+        if self._max_cached_requests < 0:
+            return
+        while len(self._cached_order) >= self._max_cached_requests:
+            if not self._cached_order:
+                break
+            self._cached_order.pop(0)
