@@ -315,6 +315,14 @@ class GenerationConfig(PushToHubMixin):
             The number of tokens to be output as candidate tokens.
         max_matching_ngram_size (`int`, *optional*):
             The maximum ngram size to be considered for matching in the prompt. Default to 2 if not provided.
+        suffix_decoding_num_tokens (`int`, *optional*):
+            The number of tokens to be output as candidate tokens using suffix tree matching. Setting this activates
+            suffix decoding assisted generation, which proposes continuations by matching the recent token tail against
+            a compressed suffix tree built from the prompt and accepted response tokens.
+        suffix_decoding_max_depth (`int`, *optional*):
+            The maximum depth of the suffix tree used for suffix decoding. Defaults to 64 if not provided.
+        suffix_decoding_min_prob (`float`, *optional*):
+            Minimum probability threshold for suffix tree path speculation. Defaults to 0.1 if not provided.
         assistant_early_exit(`int`, *optional*):
             If set to a positive integer, early exit of the model will be used as an assistant. Can only be used with
             models that support early exit (i.e. models where logits from intermediate layers can be interpreted by the LM head).
@@ -421,6 +429,9 @@ class GenerationConfig(PushToHubMixin):
         self.assistant_confidence_threshold = kwargs.pop("assistant_confidence_threshold", None)
         self.prompt_lookup_num_tokens = kwargs.pop("prompt_lookup_num_tokens", None)
         self.max_matching_ngram_size = kwargs.pop("max_matching_ngram_size", None)
+        self.suffix_decoding_num_tokens = kwargs.pop("suffix_decoding_num_tokens", None)
+        self.suffix_decoding_max_depth = kwargs.pop("suffix_decoding_max_depth", None)
+        self.suffix_decoding_min_prob = kwargs.pop("suffix_decoding_min_prob", None)
         self.assistant_early_exit = kwargs.pop("assistant_early_exit", None)
         self.assistant_lookbehind = kwargs.pop("assistant_lookbehind", None)
         self.target_lookbehind = kwargs.pop("target_lookbehind", None)
@@ -524,6 +535,7 @@ class GenerationConfig(PushToHubMixin):
             assistant_model is not None
             or self.prompt_lookup_num_tokens is not None
             or self.assistant_early_exit is not None
+            or self.suffix_decoding_num_tokens is not None
         ):
             if generation_mode in ("greedy_search", "sample"):
                 generation_mode = GenerationMode.ASSISTED_GENERATION

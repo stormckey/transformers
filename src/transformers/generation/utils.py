@@ -57,6 +57,7 @@ from .candidate_generator import (
     CandidateGenerator,
     EarlyExitCandidateGenerator,
     PromptLookupCandidateGenerator,
+    SuffixDecodingCandidateGenerator,
     UniversalSpeculativeDecodingGenerator,
     _prepare_attention_mask,
     _prepare_position_ids,
@@ -958,6 +959,16 @@ class GenerationMixin(ContinuousMixin):
                 model_kwargs=model_kwargs,
                 inputs_tensor=inputs_tensor,
                 logits_processor=logits_processor,
+            )
+        elif generation_config.suffix_decoding_num_tokens is not None:
+            candidate_generator = SuffixDecodingCandidateGenerator(
+                eos_token_id=generation_config._eos_token_tensor,
+                num_output_tokens=generation_config.suffix_decoding_num_tokens,
+                max_depth=generation_config.suffix_decoding_max_depth or 64,
+                min_prob=generation_config.suffix_decoding_min_prob or 0.1,
+                max_length=generation_config.max_length,
+                logits_processor=logits_processor,
+                vocab_size=self.config.get_text_config().vocab_size,
             )
         elif generation_config.prompt_lookup_num_tokens is not None:
             candidate_generator = PromptLookupCandidateGenerator(

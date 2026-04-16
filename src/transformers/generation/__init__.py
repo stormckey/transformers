@@ -41,6 +41,7 @@ else:
         "CandidateGenerator",
         "EarlyExitCandidateGenerator",
         "PromptLookupCandidateGenerator",
+        "SuffixDecodingCandidateGenerator",
     ]
     _import_structure["logits_process"] = [
         "AlternatingCodebooksLogitsProcessor",
@@ -132,6 +133,7 @@ if TYPE_CHECKING:
             CandidateGenerator,
             EarlyExitCandidateGenerator,
             PromptLookupCandidateGenerator,
+            SuffixDecodingCandidateGenerator,
         )
         from .continuous_batching import (
             ContinuousBatchingManager,
