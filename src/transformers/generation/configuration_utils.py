@@ -323,6 +323,9 @@ class GenerationConfig(PushToHubMixin):
             The maximum depth of the suffix tree used for suffix decoding. Defaults to 64 if not provided.
         suffix_decoding_min_prob (`float`, *optional*):
             Minimum probability threshold for suffix tree path speculation. Defaults to 0.1 if not provided.
+        suffix_decoding_cache (`SuffixDecodingCache`, *optional*):
+            A persistent cache object for cross-request suffix reuse. When provided, the suffix tree accumulates
+            response patterns from prior requests and uses them to improve speculation for future requests.
         assistant_early_exit(`int`, *optional*):
             If set to a positive integer, early exit of the model will be used as an assistant. Can only be used with
             models that support early exit (i.e. models where logits from intermediate layers can be interpreted by the LM head).
@@ -432,6 +435,7 @@ class GenerationConfig(PushToHubMixin):
         self.suffix_decoding_num_tokens = kwargs.pop("suffix_decoding_num_tokens", None)
         self.suffix_decoding_max_depth = kwargs.pop("suffix_decoding_max_depth", None)
         self.suffix_decoding_min_prob = kwargs.pop("suffix_decoding_min_prob", None)
+        self.suffix_decoding_cache = kwargs.pop("suffix_decoding_cache", None)
         self.assistant_early_exit = kwargs.pop("assistant_early_exit", None)
         self.assistant_lookbehind = kwargs.pop("assistant_lookbehind", None)
         self.target_lookbehind = kwargs.pop("target_lookbehind", None)

@@ -43,6 +43,9 @@ else:
         "PromptLookupCandidateGenerator",
         "SuffixDecodingCandidateGenerator",
     ]
+    _import_structure["suffix_tree"] = [
+        "SuffixDecodingCache",
+    ]
     _import_structure["logits_process"] = [
         "AlternatingCodebooksLogitsProcessor",
         "ClassifierFreeGuidanceLogitsProcessor",
@@ -186,6 +189,7 @@ if TYPE_CHECKING:
             StopStringCriteria,
             validate_stopping_criteria,
         )
+        from .suffix_tree import SuffixDecodingCache
         from .utils import (
             GenerateBeamDecoderOnlyOutput,
             GenerateBeamEncoderDecoderOutput,

@@ -1204,8 +1204,9 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         max_length: int = 20,
         logits_processor: Optional["LogitsProcessorList"] = None,
         vocab_size: int | None = None,
+        suffix_decoding_cache: Any | None = None,
     ):
-        from .suffix_tree import SuffixTree
+        from .suffix_tree import SuffixDecodingCache, SuffixTree
 
         self.num_output_tokens = num_output_tokens
         self.max_depth = max_depth
@@ -1215,8 +1216,10 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         self.logits_processor = logits_processor
         self.vocab_size = vocab_size
 
-        self._tree = SuffixTree(max_depth=max_depth)
+        self._cache: SuffixDecodingCache | None = suffix_decoding_cache
+        self._tree = SuffixTree(max_depth=max_depth) if self._cache is None else None
         self._seq_id = 0
+        self._req_id: int | None = None
         self._num_tokens_in_tree = 0
 
     def get_candidates(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.FloatTensor]:
@@ -1239,19 +1242,36 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         # Sync tree: append any new tokens since last call (only verified tokens)
         if input_length > self._num_tokens_in_tree:
             new_tokens = input_ids[0, self._num_tokens_in_tree :].tolist()
-            self._tree.extend(self._seq_id, new_tokens)
+            if self._cache is not None:
+                if self._req_id is None:
+                    # First call: start request with prompt tokens
+                    self._req_id = self._cache.start_request(new_tokens)
+                else:
+                    self._cache.add_active_response(self._req_id, new_tokens)
+            else:
+                self._tree.extend(self._seq_id, new_tokens)
             self._num_tokens_in_tree = input_length
 
         # Build context from the recent tail
         context_len = min(self.max_depth, input_length)
         context = input_ids[0, -context_len:].tolist()
 
+        max_spec = min(self.num_output_tokens, self.max_length - input_length - 1)
+
         # Speculate
-        draft = self._tree.speculate(
-            context=context,
-            max_spec_tokens=min(self.num_output_tokens, self.max_length - input_length - 1),
-            min_token_prob=self.min_prob,
-        )
+        if self._cache is not None and self._req_id is not None:
+            draft = self._cache.speculate(
+                req_id=self._req_id,
+                context=context,
+                max_spec_tokens=max_spec,
+                min_token_prob=self.min_prob,
+            )
+        else:
+            draft = self._tree.speculate(
+                context=context,
+                max_spec_tokens=max_spec,
+                min_token_prob=self.min_prob,
+            )
 
         if not draft.token_ids:
             return input_ids, None
@@ -1305,6 +1325,11 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         """
         # Tree update happens implicitly in the next get_candidates call when we detect new tokens in input_ids.
         return
+
+    def __del__(self):
+        if self._cache is not None and self._req_id is not None:
+            self._cache.stop_request(self._req_id)
+            self._req_id = None
 
 
 class EarlyExitCandidateGenerator(AssistedCandidateGenerator):
