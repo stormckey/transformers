@@ -339,10 +339,15 @@ class SuffixTree:
 class SuffixDecodingCache:
     """Persistent cache for suffix decoding across multiple generation calls.
 
-    Maintains a global suffix tree that accumulates response patterns from
-    completed requests, allowing future requests to draft from previously seen
-    token sequences. Each active request also gets a local suffix tree seeded
-    with its prompt tokens.
+    Maintains a pool of per-request suffix trees from completed requests,
+    allowing future requests to draft from previously seen token sequences.
+    Each active request also gets a local suffix tree seeded with its prompt
+    tokens. Speculation queries the local tree and all cached global trees,
+    returning the highest-scoring draft.
+
+    When the cache reaches capacity, the oldest request's tree is evicted
+    entirely, ensuring clean memory reclamation without requiring node-level
+    deletion from a shared tree.
 
     Usage::
 
@@ -367,7 +372,7 @@ class SuffixDecodingCache:
     def __init__(self, max_depth: int = 64, max_cached_requests: int = -1):
         self._max_depth = max_depth
         self._max_cached_requests = max_cached_requests
-        self._global_tree = SuffixTree(max_depth=max_depth)
+        self._global_trees: dict[int, SuffixTree] = {}
         self._local_trees: dict[int, SuffixTree] = {}
         self._next_seq_id = 1
         self._cached_order: list[int] = []
@@ -388,9 +393,10 @@ class SuffixDecodingCache:
         local_tree.extend(0, prompt_token_ids)
         self._local_trees[req_id] = local_tree
 
-        # Allocate a slot in the global cache if enabled
+        # Allocate a global tree slot if caching is enabled
         if self._max_cached_requests != 0:
             self._evict_if_needed()
+            self._global_trees[req_id] = SuffixTree(max_depth=self._max_depth)
             self._cached_order.append(req_id)
 
         return req_id
@@ -407,8 +413,8 @@ class SuffixDecodingCache:
         if req_id in self._local_trees:
             self._local_trees[req_id].extend(0, token_ids)
 
-        if self._max_cached_requests != 0 and req_id in self._cached_order:
-            self._global_tree.extend(req_id, token_ids)
+        if req_id in self._global_trees:
+            self._global_trees[req_id].extend(0, token_ids)
 
     def speculate(
         self,
@@ -419,7 +425,7 @@ class SuffixDecodingCache:
         max_spec_factor: float = 3.0,
         max_spec_offset: float = 5.0,
     ) -> SuffixDecodingDraft:
-        """Run speculation against both local and global trees, return the best.
+        """Run speculation against local and all cached global trees, return the best.
 
         Args:
             req_id: The request ID returned by :meth:`start_request`.
@@ -430,7 +436,7 @@ class SuffixDecodingCache:
             max_spec_offset: Soft cap offset.
 
         Returns:
-            The highest-scoring draft from either tree.
+            The highest-scoring draft from any tree.
         """
         spec_kwargs = {
             "context": context,
@@ -447,10 +453,12 @@ class SuffixDecodingCache:
             if local_draft.score >= best.score:
                 best = local_draft
 
-        if self._max_cached_requests != 0:
-            global_draft = self._global_tree.speculate(**spec_kwargs)
-            if global_draft.score >= best.score:
-                best = global_draft
+        for cached_id, tree in self._global_trees.items():
+            if cached_id == req_id:
+                continue  # skip own global tree, local tree covers it
+            draft = tree.speculate(**spec_kwargs)
+            if draft.score >= best.score:
+                best = draft
 
         return best
 
@@ -463,10 +471,11 @@ class SuffixDecodingCache:
         self._local_trees.pop(req_id, None)
 
     def _evict_if_needed(self) -> None:
-        """Evict the oldest cached response if at capacity."""
+        """Evict the oldest cached response tree if at capacity."""
         if self._max_cached_requests < 0:
             return
         while len(self._cached_order) >= self._max_cached_requests:
             if not self._cached_order:
                 break
-            self._cached_order.pop(0)
+            evicted_id = self._cached_order.pop(0)
+            self._global_trees.pop(evicted_id, None)
