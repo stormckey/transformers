@@ -367,11 +367,27 @@ class SuffixDecodingCache:
             the global cache. When exceeded, oldest responses are evicted.
             Set to 0 to disable the global cache entirely (local-only mode).
             Set to -1 for unlimited caching.
+        source_mode: Which candidate source(s) to use when speculating.
+            ``"local_and_global"`` compares the active request's local tree
+            against all cached global trees and keeps the highest-scoring
+            draft. ``"local_only"`` uses only the active request's tree.
+            ``"global_only"`` uses only cached trees from prior requests.
     """
 
-    def __init__(self, max_depth: int = 64, max_cached_requests: int = -1):
+    def __init__(
+        self,
+        max_depth: int = 64,
+        max_cached_requests: int = -1,
+        source_mode: str = "local_and_global",
+    ):
+        if source_mode not in {"local_and_global", "local_only", "global_only"}:
+            raise ValueError(
+                "source_mode must be one of: "
+                "'local_and_global', 'local_only', 'global_only'"
+            )
         self._max_depth = max_depth
         self._max_cached_requests = max_cached_requests
+        self._source_mode = source_mode
         self._global_trees: dict[int, SuffixTree] = {}
         self._local_trees: dict[int, SuffixTree] = {}
         self._next_seq_id = 1
@@ -448,17 +464,18 @@ class SuffixDecodingCache:
 
         best = SuffixDecodingDraft()
 
-        if req_id in self._local_trees:
+        if self._source_mode in {"local_and_global", "local_only"} and req_id in self._local_trees:
             local_draft = self._local_trees[req_id].speculate(**spec_kwargs)
             if local_draft.score >= best.score:
                 best = local_draft
 
-        for cached_id, tree in self._global_trees.items():
-            if cached_id == req_id:
-                continue  # skip own global tree, local tree covers it
-            draft = tree.speculate(**spec_kwargs)
-            if draft.score >= best.score:
-                best = draft
+        if self._source_mode in {"local_and_global", "global_only"}:
+            for cached_id, tree in self._global_trees.items():
+                if cached_id == req_id:
+                    continue  # skip own global tree, local tree covers it
+                draft = tree.speculate(**spec_kwargs)
+                if draft.score >= best.score:
+                    best = draft
 
         return best
 
