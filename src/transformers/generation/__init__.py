@@ -41,6 +41,10 @@ else:
         "CandidateGenerator",
         "EarlyExitCandidateGenerator",
         "PromptLookupCandidateGenerator",
+        "SuffixDecodingCandidateGenerator",
+    ]
+    _import_structure["suffix_tree"] = [
+        "SuffixDecodingCache",
     ]
     _import_structure["logits_process"] = [
         "AlternatingCodebooksLogitsProcessor",
@@ -132,6 +136,7 @@ if TYPE_CHECKING:
             CandidateGenerator,
             EarlyExitCandidateGenerator,
             PromptLookupCandidateGenerator,
+            SuffixDecodingCandidateGenerator,
         )
         from .continuous_batching import (
             ContinuousBatchingManager,
@@ -184,6 +189,7 @@ if TYPE_CHECKING:
             StopStringCriteria,
             validate_stopping_criteria,
         )
+        from .suffix_tree import SuffixDecodingCache
         from .utils import (
             GenerateBeamDecoderOnlyOutput,
             GenerateBeamEncoderDecoderOutput,

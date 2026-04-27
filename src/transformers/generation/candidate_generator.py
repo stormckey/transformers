@@ -1165,6 +1165,173 @@ class PromptLookupCandidateGenerator(CandidateGenerator):
         return
 
 
+class SuffixDecodingCandidateGenerator(CandidateGenerator):
+    """
+    `CandidateGenerator` class to be used for suffix decoding assisted generation. This class generates candidates by
+    maintaining a compressed suffix tree over the prompt and accepted response tokens, then matching the recent token
+    tail to propose likely continuations ranked by frequency.
+
+    Unlike `PromptLookupCandidateGenerator` which does a naive n-gram search each step, this generator incrementally
+    builds a suffix tree that enables efficient matching against all suffixes of the token history.
+
+    Args:
+        eos_token_id (`torch.Tensor`, *optional*):
+            The token id of the end of sequence token.
+        num_output_tokens (`int`, *optional*, defaults to 10):
+            The maximum number of tokens to be output as candidate tokens.
+        max_depth (`int`, *optional*, defaults to 64):
+            The maximum depth of the suffix tree. Controls how long suffix patterns can be tracked.
+        min_prob (`float`, *optional*, defaults to 0.1):
+            Minimum probability threshold for path speculation. Speculation stops when the cumulative
+            probability of the next token drops below this value.
+        max_length (`int`, *optional*, defaults to 20):
+            The number of total maximum tokens that can be generated. For decoder-only models that includes the
+            prompt length. Defaults to 20, which is the max length used as default in generation config.
+        logits_processor (`LogitsProcessorList`, *optional*):
+            An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+            used to modify the prediction scores of the language modeling head applied at each generation step.
+            Used to find forbidden tokens and block them from being valid candidates.
+        vocab_size (`int`, *optional*):
+            The size of the vocabulary. Required if `logits_processor` is provided.
+    """
+
+    def __init__(
+        self,
+        eos_token_id: torch.Tensor | None = None,
+        num_output_tokens: int = 10,
+        max_depth: int = 64,
+        min_prob: float = 0.1,
+        max_length: int = 20,
+        logits_processor: Optional["LogitsProcessorList"] = None,
+        vocab_size: int | None = None,
+        suffix_decoding_cache: Any | None = None,
+    ):
+        from .suffix_tree import SuffixDecodingCache, SuffixTree
+
+        self.num_output_tokens = num_output_tokens
+        self.max_depth = max_depth
+        self.min_prob = min_prob
+        self.max_length = max_length
+        self.eos_token_id = eos_token_id
+        self.logits_processor = logits_processor
+        self.vocab_size = vocab_size
+
+        self._cache: SuffixDecodingCache | None = suffix_decoding_cache
+        self._tree = SuffixTree(max_depth=max_depth) if self._cache is None else None
+        self._seq_id = 0
+        self._req_id: int | None = None
+        self._num_tokens_in_tree = 0
+
+    def get_candidates(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.FloatTensor]:
+        """
+        Fetches the candidates to be tried for the current input.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. [What are input IDs?](../glossary#input-ids)
+
+        Return:
+            `torch.LongTensor` of shape `(num_candidates, candidate_length)`: The candidate sequences to be tried.
+        """
+        bsz, input_length = input_ids.shape
+
+        # Don't generate more than `max_length - 1` candidates since the target model generates one extra token.
+        if self.max_length == input_length + 1:
+            return input_ids, None
+
+        # Sync tree: append any new tokens since last call (only verified tokens)
+        if input_length > self._num_tokens_in_tree:
+            new_tokens = input_ids[0, self._num_tokens_in_tree :].tolist()
+            if self._cache is not None:
+                if self._req_id is None:
+                    # First call: start request with prompt tokens
+                    self._req_id = self._cache.start_request(new_tokens)
+                else:
+                    self._cache.add_active_response(self._req_id, new_tokens)
+            else:
+                self._tree.extend(self._seq_id, new_tokens)
+            self._num_tokens_in_tree = input_length
+
+        # Build context from the recent tail
+        context_len = min(self.max_depth, input_length)
+        context = input_ids[0, -context_len:].tolist()
+
+        max_spec = min(self.num_output_tokens, self.max_length - input_length - 1)
+
+        # Speculate
+        if self._cache is not None and self._req_id is not None:
+            draft = self._cache.speculate(
+                req_id=self._req_id,
+                context=context,
+                max_spec_tokens=max_spec,
+                min_token_prob=self.min_prob,
+            )
+        else:
+            draft = self._tree.speculate(
+                context=context,
+                max_spec_tokens=max_spec,
+                min_token_prob=self.min_prob,
+            )
+
+        if not draft.token_ids:
+            return input_ids, None
+
+        chosen_ids = torch.tensor(draft.token_ids, dtype=input_ids.dtype, device=input_ids.device)
+
+        # Filter forbidden tokens via logits processor (same pattern as PromptLookupCandidateGenerator)
+        if self.logits_processor is not None:
+            sequence_with_candidate = input_ids
+            fake_input_logits = torch.ones((bsz, self.vocab_size), device=input_ids.device, dtype=torch.float32)
+            for candidate_idx, new_candidate_token in enumerate(chosen_ids):
+                fake_output_logits = self.logits_processor(sequence_with_candidate, fake_input_logits)
+                fake_candidate_logits = fake_output_logits[0, new_candidate_token]
+                if fake_candidate_logits in (-float("Inf"), torch.finfo(fake_candidate_logits.dtype).min):
+                    chosen_ids = chosen_ids[:candidate_idx]
+                    break
+                else:
+                    sequence_with_candidate = torch.cat(
+                        (input_ids, chosen_ids[: candidate_idx + 1].unsqueeze(0)), dim=1
+                    )
+            if chosen_ids.shape[0] == 0:
+                return input_ids, None
+
+        # Truncate at first EOS token
+        if self.eos_token_id is not None:
+            mask = torch.isin(chosen_ids, self.eos_token_id)
+            match_indices_eos = torch.nonzero(mask)
+            if match_indices_eos.numel() > 0:
+                first_eos_index = match_indices_eos[0].item()
+                chosen_ids = chosen_ids[:first_eos_index]
+
+        if len(chosen_ids) == 0:
+            return input_ids, None
+
+        chosen_ids = chosen_ids.unsqueeze(0)
+        candidate_input_ids = torch.cat((input_ids, chosen_ids), dim=1)
+        return candidate_input_ids, None
+
+    def update_candidate_strategy(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, num_matches: int):
+        """
+        Updates the candidate generation strategy based on the outcomes.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. [What are input IDs?](../glossary#input-ids)
+            scores (`torch.FloatTensor` of shape `(batch_size, candidate_length, config.vocab_size)`):
+                Prediction scores of a language modeling head. These can be logits for each vocabulary when not using
+                beam search or log softmax for each vocabulary token when using beam search
+            num_matches (`int`):
+                The number of matches between the candidate sequences and the model predictions.
+        """
+        # Tree update happens implicitly in the next get_candidates call when we detect new tokens in input_ids.
+        return
+
+    def __del__(self):
+        if self._cache is not None and self._req_id is not None:
+            self._cache.stop_request(self._req_id)
+            self._req_id = None
+
+
 class EarlyExitCandidateGenerator(AssistedCandidateGenerator):
     """
     `CandidateGenerator` class to be used for assisted generation and speculative decoding. This class generates
