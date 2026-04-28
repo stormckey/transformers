@@ -1221,6 +1221,22 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         self._seq_id = 0
         self._req_id: int | None = None
         self._num_tokens_in_tree = 0
+        self.tree_draft = None
+
+    def _speculate(self, context: list[int], max_spec_tokens: int):
+        """Return the suffix draft for the current context."""
+        if self._cache is not None and self._req_id is not None:
+            return self._cache.speculate(
+                req_id=self._req_id,
+                context=context,
+                max_spec_tokens=max_spec_tokens,
+                min_token_prob=self.min_prob,
+            )
+        return self._tree.speculate(
+            context=context,
+            max_spec_tokens=max_spec_tokens,
+            min_token_prob=self.min_prob,
+        )
 
     def get_candidates(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.FloatTensor]:
         """
@@ -1233,6 +1249,7 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         Return:
             `torch.LongTensor` of shape `(num_candidates, candidate_length)`: The candidate sequences to be tried.
         """
+        self.tree_draft = None
         bsz, input_length = input_ids.shape
 
         # Don't generate more than `max_length - 1` candidates since the target model generates one extra token.
@@ -1259,19 +1276,7 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         max_spec = min(self.num_output_tokens, self.max_length - input_length - 1)
 
         # Speculate
-        if self._cache is not None and self._req_id is not None:
-            draft = self._cache.speculate(
-                req_id=self._req_id,
-                context=context,
-                max_spec_tokens=max_spec,
-                min_token_prob=self.min_prob,
-            )
-        else:
-            draft = self._tree.speculate(
-                context=context,
-                max_spec_tokens=max_spec,
-                min_token_prob=self.min_prob,
-            )
+        draft = self._speculate(context, max_spec)
 
         if not draft.token_ids:
             return input_ids, None
@@ -1294,6 +1299,10 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
                     )
             if chosen_ids.shape[0] == 0:
                 return input_ids, None
+            draft.token_ids = draft.token_ids[: chosen_ids.shape[0]]
+            draft.parents = draft.parents[: chosen_ids.shape[0]]
+            draft.probs = draft.probs[: chosen_ids.shape[0]]
+            draft.depths = draft.depths[: chosen_ids.shape[0]]
 
         # Truncate at first EOS token
         if self.eos_token_id is not None:
@@ -1302,10 +1311,15 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
             if match_indices_eos.numel() > 0:
                 first_eos_index = match_indices_eos[0].item()
                 chosen_ids = chosen_ids[:first_eos_index]
+                draft.token_ids = draft.token_ids[:first_eos_index]
+                draft.parents = draft.parents[:first_eos_index]
+                draft.probs = draft.probs[:first_eos_index]
+                draft.depths = draft.depths[:first_eos_index]
 
         if len(chosen_ids) == 0:
             return input_ids, None
 
+        self.tree_draft = draft if draft.is_tree else None
         chosen_ids = chosen_ids.unsqueeze(0)
         candidate_input_ids = torch.cat((input_ids, chosen_ids), dim=1)
         return candidate_input_ids, None
@@ -1330,6 +1344,58 @@ class SuffixDecodingCandidateGenerator(CandidateGenerator):
         if self._cache is not None and self._req_id is not None:
             self._cache.stop_request(self._req_id)
             self._req_id = None
+
+
+class TreeSpecDecodingCandidateGenerator(SuffixDecodingCandidateGenerator):
+    """
+    Candidate generator for tree-based suffix speculative decoding.
+
+    It uses the same suffix-tree source as [`SuffixDecodingCandidateGenerator`],
+    but returns a flattened branching draft tree plus parent/depth metadata.
+    The generation loop uses that metadata to build a tree attention mask and
+    verify multiple continuation branches in one target-model forward pass.
+    """
+
+    def __init__(
+        self,
+        eos_token_id: torch.Tensor | None = None,
+        num_output_tokens: int = 10,
+        max_depth: int = 64,
+        min_prob: float = 0.1,
+        branch_factor: int = 2,
+        max_length: int = 20,
+        logits_processor: Optional["LogitsProcessorList"] = None,
+        vocab_size: int | None = None,
+        suffix_decoding_cache: Any | None = None,
+    ):
+        super().__init__(
+            eos_token_id=eos_token_id,
+            num_output_tokens=num_output_tokens,
+            max_depth=max_depth,
+            min_prob=min_prob,
+            max_length=max_length,
+            logits_processor=logits_processor,
+            vocab_size=vocab_size,
+            suffix_decoding_cache=suffix_decoding_cache,
+        )
+        self.branch_factor = branch_factor
+
+    def _speculate(self, context: list[int], max_spec_tokens: int):
+        """Return a branching suffix draft for the current context."""
+        if self._cache is not None and self._req_id is not None:
+            return self._cache.speculate_tree(
+                req_id=self._req_id,
+                context=context,
+                max_spec_tokens=max_spec_tokens,
+                min_token_prob=self.min_prob,
+                branch_factor=self.branch_factor,
+            )
+        return self._tree.speculate_tree(
+            context=context,
+            max_spec_tokens=max_spec_tokens,
+            min_token_prob=self.min_prob,
+            branch_factor=self.branch_factor,
+        )
 
 
 class EarlyExitCandidateGenerator(AssistedCandidateGenerator):

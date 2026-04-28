@@ -9,9 +9,62 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Genera
 from transformers.generation.candidate_generator import (
     AssistantToTargetTranslator,
     AssistantVocabTranslatorCache,
+    TreeSpecDecodingCandidateGenerator,
     UniversalSpeculativeDecodingGenerator,
 )
+from transformers.generation.suffix_tree import SuffixDecodingDraft, SuffixTree
+from transformers.generation.utils import _tree_spec_acceptance
 from transformers.testing_utils import require_torch, torch_device
+
+
+@require_torch
+class TestTreeSpecDecoding(unittest.TestCase):
+    def test_suffix_tree_branching_draft(self):
+        suffix_tree = SuffixTree(max_depth=8)
+        suffix_tree.extend(0, [1, 2, 3, 1, 2, 4, 1, 2, 5])
+
+        draft = suffix_tree.speculate_tree([1, 2], max_spec_tokens=6, min_token_prob=0.0, branch_factor=3)
+
+        self.assertTrue(draft.is_tree)
+        self.assertEqual(draft.token_ids[:3], [3, 4, 5])
+        self.assertEqual(draft.parents[:3], [-1, -1, -1])
+        self.assertEqual(draft.depths[:3], [1, 1, 1])
+
+    def test_tree_spec_candidate_generator_sets_tree_draft(self):
+        generator = TreeSpecDecodingCandidateGenerator(
+            num_output_tokens=6,
+            max_depth=8,
+            min_prob=0.0,
+            branch_factor=3,
+            max_length=20,
+        )
+        input_ids = torch.tensor([[1, 2, 3, 1, 2, 4, 1, 2]])
+
+        candidate_input_ids, _ = generator.get_candidates(input_ids)
+
+        self.assertGreater(candidate_input_ids.shape[1], input_ids.shape[1])
+        self.assertIsNotNone(generator.tree_draft)
+        self.assertTrue(generator.tree_draft.is_tree)
+
+    def test_tree_spec_acceptance_follows_matching_branch(self):
+        draft = SuffixDecodingDraft(token_ids=[5, 6, 7], parents=[-1, -1, 0], depths=[1, 1, 2])
+        candidate_input_ids = torch.tensor([[1, 2, 5, 6, 7]])
+        logits = torch.zeros((1, 4, 10))
+        logits[0, 0, 5] = 1
+        logits[0, 1, 7] = 1
+        logits[0, 3, 9] = 1
+
+        valid_tokens, num_matches, logits_indices = _tree_spec_acceptance(
+            candidate_input_ids,
+            logits,
+            draft,
+            do_sample=False,
+            is_done_candidate=False,
+        )
+
+        self.assertEqual(valid_tokens.tolist(), [[5, 7, 9]])
+        self.assertEqual(num_matches, 2)
+        self.assertEqual(logits_indices, [0, 1, 3])
 
 
 @require_torch

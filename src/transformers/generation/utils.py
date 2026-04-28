@@ -58,6 +58,7 @@ from .candidate_generator import (
     EarlyExitCandidateGenerator,
     PromptLookupCandidateGenerator,
     SuffixDecodingCandidateGenerator,
+    TreeSpecDecodingCandidateGenerator,
     UniversalSpeculativeDecodingGenerator,
     _prepare_attention_mask,
     _prepare_position_ids,
@@ -959,6 +960,20 @@ class GenerationMixin(ContinuousMixin):
                 model_kwargs=model_kwargs,
                 inputs_tensor=inputs_tensor,
                 logits_processor=logits_processor,
+            )
+        elif generation_config.tree_spec_decoding_num_tokens is not None:
+            if self.config.is_encoder_decoder:
+                raise ValueError("tree-based suffix speculative decoding currently supports decoder-only models.")
+            candidate_generator = TreeSpecDecodingCandidateGenerator(
+                eos_token_id=generation_config._eos_token_tensor,
+                num_output_tokens=generation_config.tree_spec_decoding_num_tokens,
+                max_depth=generation_config.tree_spec_decoding_max_depth or 64,
+                min_prob=generation_config.tree_spec_decoding_min_prob or 0.1,
+                branch_factor=generation_config.tree_spec_decoding_branch_factor or 2,
+                max_length=generation_config.max_length,
+                logits_processor=logits_processor,
+                vocab_size=self.config.get_text_config().vocab_size,
+                suffix_decoding_cache=getattr(generation_config, "tree_spec_decoding_cache", None),
             )
         elif generation_config.suffix_decoding_num_tokens is not None:
             candidate_generator = SuffixDecodingCandidateGenerator(
@@ -3527,6 +3542,7 @@ class GenerationMixin(ContinuousMixin):
             candidate_input_ids = candidate_input_ids.to(self.device)
             if candidate_logits is not None:
                 candidate_logits = candidate_logits.to(self.device)
+            tree_draft = getattr(candidate_generator, "tree_draft", None)
 
             candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
             is_done_candidate = stopping_criteria(candidate_input_ids, None)
@@ -3536,16 +3552,26 @@ class GenerationMixin(ContinuousMixin):
             # we use this forward pass to also pick the subsequent logits in the original model.
 
             # 2.1. Prepare the model inputs
-            candidate_kwargs = copy.copy(model_kwargs)
-            candidate_kwargs = _prepare_attention_mask(
-                candidate_kwargs, candidate_input_ids.shape[1], self.config.is_encoder_decoder
-            )
-            candidate_kwargs = _prepare_token_type_ids(candidate_kwargs, candidate_input_ids.shape[1])
-            if (position_ids := candidate_kwargs.get("position_ids")) is not None and candidate_length > 0:
-                new_length = candidate_length + position_ids.shape[-1]
-                candidate_kwargs = _prepare_position_ids(candidate_kwargs, new_length, self.config.is_encoder_decoder)
+            if tree_draft is not None:
+                candidate_kwargs = _prepare_tree_spec_model_kwargs(
+                    model_kwargs,
+                    input_ids,
+                    candidate_input_ids,
+                    tree_draft,
+                    getattr(self, "dtype", torch.float32),
+                )
+                next_sequence_length = None
+            else:
+                candidate_kwargs = copy.copy(model_kwargs)
+                candidate_kwargs = _prepare_attention_mask(
+                    candidate_kwargs, candidate_input_ids.shape[1], self.config.is_encoder_decoder
+                )
+                candidate_kwargs = _prepare_token_type_ids(candidate_kwargs, candidate_input_ids.shape[1])
+                if (position_ids := candidate_kwargs.get("position_ids")) is not None and candidate_length > 0:
+                    new_length = candidate_length + position_ids.shape[-1]
+                    candidate_kwargs = _prepare_position_ids(candidate_kwargs, new_length, self.config.is_encoder_decoder)
 
-            next_sequence_length = candidate_length + 1 if not is_first_iteration else None
+                next_sequence_length = candidate_length + 1 if not is_first_iteration else None
             model_inputs = self.prepare_inputs_for_generation(
                 candidate_input_ids,
                 next_sequence_length=next_sequence_length,
@@ -3573,7 +3599,16 @@ class GenerationMixin(ContinuousMixin):
             # 3. Select the accepted tokens. There are two possible cases:
             # Case 1: `do_sample=True` and we have logits for the candidates (originally from speculative decoding)
             # 👉 Apply algorithm 1 from the speculative decoding paper (https://huggingface.co/papers/2211.17192).
-            if do_sample and candidate_logits is not None:
+            tree_logits_indices = None
+            if tree_draft is not None:
+                valid_tokens, n_matches, tree_logits_indices = _tree_spec_acceptance(
+                    candidate_input_ids,
+                    new_logits,
+                    tree_draft,
+                    do_sample,
+                    is_done_candidate,
+                )
+            elif do_sample and candidate_logits is not None:
                 valid_tokens, n_matches = _speculative_sampling(
                     candidate_input_ids,
                     candidate_logits,
@@ -3610,9 +3645,11 @@ class GenerationMixin(ContinuousMixin):
             if streamer is not None:
                 streamer.put(valid_tokens.cpu())
             new_cur_len = input_ids.shape[1]
+            num_added_tokens = valid_tokens.shape[-1]
 
             # 4.2. Discard past key values relative to unused assistant tokens
-            outputs.past_key_values.crop(new_cur_len - 1)
+            if tree_draft is None:
+                outputs.past_key_values.crop(new_cur_len - 1)
 
             # 5. Update the candidate generation strategy if needed
             candidate_generator.update_candidate_strategy(input_ids, new_logits, n_matches)
@@ -3622,19 +3659,28 @@ class GenerationMixin(ContinuousMixin):
                 outputs,
                 model_kwargs,
                 is_encoder_decoder=self.config.is_encoder_decoder,
-                num_new_tokens=n_matches + 1,
+                num_new_tokens=num_added_tokens,
             )
+            if tree_draft is not None:
+                for cache_name in ALL_CACHE_NAMES:
+                    model_kwargs.pop(cache_name, None)
             if synced_gpus and this_peer_finished:
                 continue
 
             # Store scores, attentions and hidden_states when required
             # Assistant: modified to append one tuple element per token, as in the other generation methods.
             if return_dict_in_generate:
-                newly_added_length = n_matches + 1
+                newly_added_length = num_added_tokens
                 if output_scores:
-                    scores += tuple(new_logits[:, i, :] for i in range(newly_added_length))
+                    if tree_logits_indices is None:
+                        scores += tuple(new_logits[:, i, :] for i in range(newly_added_length))
+                    else:
+                        scores += tuple(new_logits[:, i, :] for i in tree_logits_indices)
                 if output_logits:
-                    raw_logits += tuple(next_token_logits[:, i, :] for i in range(newly_added_length))
+                    if tree_logits_indices is None:
+                        raw_logits += tuple(next_token_logits[:, i, :] for i in range(newly_added_length))
+                    else:
+                        raw_logits += tuple(next_token_logits[:, i, :] for i in tree_logits_indices)
 
                 newly_added_length = new_cur_len if is_first_iteration else newly_added_length
                 if output_attentions:
@@ -3854,6 +3900,126 @@ def _speculative_sampling(
             valid_tokens = t
 
     return valid_tokens, n_matches
+
+
+def _prepare_tree_spec_model_kwargs(
+    model_kwargs: dict[str, Any],
+    input_ids: torch.LongTensor,
+    candidate_input_ids: torch.LongTensor,
+    tree_draft: Any,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Build full-sequence kwargs for correctness-first tree verification.
+
+    SGLang verifies a flattened draft tree with a custom tree attention mask and retrieve indices. For generic
+    Transformers models we use the same logical representation, but run the target model without reusing the KV cache so
+    we do not need model-specific KV compaction after accepting a non-prefix branch.
+    """
+    candidate_kwargs = copy.copy(model_kwargs)
+    for cache_name in ALL_CACHE_NAMES:
+        candidate_kwargs.pop(cache_name, None)
+
+    batch_size, cur_len = input_ids.shape
+    if batch_size != 1:
+        raise ValueError("tree-based suffix speculative decoding currently supports batch_size = 1.")
+
+    total_len = candidate_input_ids.shape[1]
+    draft_len = total_len - cur_len
+    device = candidate_input_ids.device
+    candidate_kwargs = _prepare_token_type_ids(candidate_kwargs, total_len)
+
+    attention_mask_2d = model_kwargs.get("attention_mask")
+    if attention_mask_2d is None:
+        prompt_mask = torch.ones((cur_len,), dtype=torch.bool, device=device)
+    else:
+        prompt_mask = attention_mask_2d[0, :cur_len].to(device=device, dtype=torch.bool)
+
+    mask_dtype = dtype if dtype.is_floating_point else torch.float32
+    min_dtype = torch.finfo(mask_dtype).min
+    tree_mask = torch.full((1, 1, total_len, total_len), min_dtype, dtype=mask_dtype, device=device)
+
+    for query_idx in range(cur_len):
+        tree_mask[0, 0, query_idx, : query_idx + 1] = 0
+        tree_mask[0, 0, query_idx, :cur_len].masked_fill_(~prompt_mask, min_dtype)
+
+    ancestors: list[list[int]] = []
+    for draft_idx in range(draft_len):
+        parent = tree_draft.parents[draft_idx]
+        node_ancestors = [] if parent == -1 else [*ancestors[parent], parent]
+        ancestors.append(node_ancestors)
+
+        query_idx = cur_len + draft_idx
+        tree_mask[0, 0, query_idx, :cur_len] = torch.where(
+            prompt_mask,
+            torch.zeros((), dtype=mask_dtype, device=device),
+            torch.full((), min_dtype, dtype=mask_dtype, device=device),
+        )
+        for ancestor in node_ancestors:
+            tree_mask[0, 0, query_idx, cur_len + ancestor] = 0
+        tree_mask[0, 0, query_idx, query_idx] = 0
+
+    candidate_kwargs["attention_mask"] = tree_mask
+
+    position_ids = model_kwargs.get("position_ids")
+    if position_ids is None:
+        full_position_ids = torch.arange(total_len, dtype=torch.long, device=device).unsqueeze(0)
+    else:
+        full_position_ids = torch.empty((1, total_len), dtype=position_ids.dtype, device=device)
+        full_position_ids[:, :cur_len] = position_ids[:, :cur_len].to(device)
+    root_position = full_position_ids[0, cur_len - 1]
+    for draft_idx, depth in enumerate(tree_draft.depths):
+        full_position_ids[0, cur_len + draft_idx] = root_position + depth
+    candidate_kwargs["position_ids"] = full_position_ids
+
+    return candidate_kwargs
+
+
+def _tree_spec_acceptance(
+    candidate_input_ids: torch.LongTensor,
+    new_logits: torch.FloatTensor,
+    tree_draft: Any,
+    do_sample: bool,
+    is_done_candidate: bool,
+) -> tuple[torch.LongTensor, int, list[int]]:
+    """Accept a single path through a verified draft tree."""
+    if do_sample:
+        probs = new_logits.softmax(dim=-1)
+        selected_tokens = torch.multinomial(probs[0, :, :], num_samples=1).squeeze(1)
+    else:
+        selected_tokens = new_logits.argmax(dim=-1)[0]
+
+    children_by_parent: dict[int, list[int]] = {}
+    for node_idx, parent in enumerate(tree_draft.parents):
+        children_by_parent.setdefault(parent, []).append(node_idx)
+
+    valid_tokens = []
+    logits_indices = []
+    n_matches = 0
+    parent = -1
+
+    while True:
+        logits_idx = 0 if parent == -1 else parent + 1
+        selected_token = selected_tokens[logits_idx]
+        logits_indices.append(logits_idx)
+
+        matching_child = None
+        for child in children_by_parent.get(parent, []):
+            if tree_draft.token_ids[child] == selected_token.item():
+                matching_child = child
+                break
+
+        valid_tokens.append(selected_token)
+        if matching_child is None:
+            break
+
+        n_matches += 1
+        parent = matching_child
+
+        if is_done_candidate:
+            break
+
+    valid_tokens = torch.stack(valid_tokens).unsqueeze(0).to(candidate_input_ids.device)
+    return valid_tokens, n_matches, logits_indices
 
 
 def _split_model_outputs(outputs, new_outputs, cur_len, added_len, is_decoder_attention=False):

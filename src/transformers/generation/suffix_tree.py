@@ -24,6 +24,7 @@ The algorithm is based on the suffix tree described in Arctic Inference
 (https://github.com/snowflakedb/ArcticInference).
 """
 
+import heapq
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -32,11 +33,17 @@ from dataclasses import dataclass, field
 class SuffixDecodingDraft:
     """Output of suffix tree speculation."""
 
-    token_ids: list = field(default_factory=list)
-    parents: list = field(default_factory=list)
-    probs: list = field(default_factory=list)
+    token_ids: list[int] = field(default_factory=list)
+    parents: list[int] = field(default_factory=list)
+    probs: list[float] = field(default_factory=list)
+    depths: list[int] = field(default_factory=list)
     score: float = 0.0
     match_len: int = 0
+
+    @property
+    def is_tree(self) -> bool:
+        """Whether this draft contains branching structure."""
+        return any(parent != idx - 1 for idx, parent in enumerate(self.parents))
 
 
 class SuffixTreeNode:
@@ -275,6 +282,7 @@ class SuffixTree:
                 draft.parents.append(parent_idx)
                 draft.token_ids.append(ref_data[node.ref_idx + idx])
                 draft.probs.append(prob)
+                draft.depths.append(len(draft.token_ids))
                 draft.score += prob
                 idx += 1
             else:
@@ -285,6 +293,60 @@ class SuffixTree:
                 node = child
                 ref_data = self._seqs[node.ref_seq]
                 idx = 0
+
+        return draft
+
+    def speculate_tree_path(
+        self,
+        node: SuffixTreeNode,
+        idx: int,
+        max_spec_tokens: int,
+        min_token_prob: float,
+        branch_factor: int,
+    ) -> SuffixDecodingDraft:
+        """Generate a branching draft from a matched suffix tree position.
+
+        The output is a topologically sorted tree: every token's parent appears
+        before the token itself, and parent ``-1`` means the token is a direct
+        child of the current generation context. Expansion is probability-ranked
+        and bounded by ``branch_factor`` children per suffix-tree node.
+        """
+        if max_spec_tokens <= 0:
+            return SuffixDecodingDraft()
+
+        draft = SuffixDecodingDraft()
+        branch_factor = max(branch_factor, 1)
+        counter = 0
+        queue = [(-1.0, counter, node, idx, -1, 0)]
+
+        while queue and len(draft.token_ids) < max_spec_tokens:
+            neg_prob, _, node, idx, parent_idx, depth = heapq.heappop(queue)
+            prob = -neg_prob
+            if prob < min_token_prob:
+                continue
+
+            if idx < node.length:
+                ref_data = self._seqs[node.ref_seq]
+                draft_idx = len(draft.token_ids)
+                draft.parents.append(parent_idx)
+                draft.token_ids.append(ref_data[node.ref_idx + idx])
+                draft.probs.append(prob)
+                draft.depths.append(depth + 1)
+                draft.score += prob
+                counter += 1
+                heapq.heappush(queue, (-prob, counter, node, idx + 1, draft_idx, depth + 1))
+                continue
+
+            if node.count == 0:
+                continue
+
+            children = sorted(node.children.values(), key=lambda child: child.count, reverse=True)[:branch_factor]
+            for child in children:
+                child_prob = prob * child.count / node.count
+                if child_prob < min_token_prob:
+                    continue
+                counter += 1
+                heapq.heappush(queue, (-child_prob, counter, child, 0, parent_idx, depth))
 
         return draft
 
@@ -329,6 +391,40 @@ class SuffixTree:
             effective_max = min(max_spec_tokens, max(cap, 0))
 
             draft = self.speculate_path(node, idx, effective_max, min_token_prob)
+            if draft.score >= best.score:
+                draft.match_len = match_len
+                best = draft
+
+        return best
+
+    def speculate_tree(
+        self,
+        context: list[int],
+        max_spec_tokens: int,
+        min_token_prob: float = 0.1,
+        branch_factor: int = 2,
+        max_spec_factor: float = 3.0,
+        max_spec_offset: float = 5.0,
+    ) -> SuffixDecodingDraft:
+        """Produce a branching speculative draft by matching context suffixes.
+
+        This follows the same suffix matching policy as :meth:`speculate`, but
+        expands multiple high-frequency continuations from each matched tree
+        node. The result can be verified with a tree attention mask.
+        """
+        best = SuffixDecodingDraft()
+
+        for match_len in range(1, len(context)):
+            sub_context = context[-match_len:]
+            result = self.match_context(sub_context)
+            if result is None:
+                break
+
+            node, idx = result
+            cap = int(match_len * max_spec_factor + max_spec_offset + 1e-6)
+            effective_max = min(max_spec_tokens, max(cap, 0))
+
+            draft = self.speculate_tree_path(node, idx, effective_max, min_token_prob, branch_factor)
             if draft.score >= best.score:
                 draft.match_len = match_len
                 best = draft
@@ -474,6 +570,43 @@ class SuffixDecodingCache:
                 if cached_id == req_id:
                     continue  # skip own global tree, local tree covers it
                 draft = tree.speculate(**spec_kwargs)
+                if draft.score >= best.score:
+                    best = draft
+
+        return best
+
+    def speculate_tree(
+        self,
+        req_id: int,
+        context: list[int],
+        max_spec_tokens: int,
+        min_token_prob: float = 0.1,
+        branch_factor: int = 2,
+        max_spec_factor: float = 3.0,
+        max_spec_offset: float = 5.0,
+    ) -> SuffixDecodingDraft:
+        """Run branching speculation against local/global suffix trees."""
+        spec_kwargs = {
+            "context": context,
+            "max_spec_tokens": max_spec_tokens,
+            "min_token_prob": min_token_prob,
+            "branch_factor": branch_factor,
+            "max_spec_factor": max_spec_factor,
+            "max_spec_offset": max_spec_offset,
+        }
+
+        best = SuffixDecodingDraft()
+
+        if self._source_mode in {"local_and_global", "local_only"} and req_id in self._local_trees:
+            local_draft = self._local_trees[req_id].speculate_tree(**spec_kwargs)
+            if local_draft.score >= best.score:
+                best = local_draft
+
+        if self._source_mode in {"local_and_global", "global_only"}:
+            for cached_id, tree in self._global_trees.items():
+                if cached_id == req_id:
+                    continue
+                draft = tree.speculate_tree(**spec_kwargs)
                 if draft.score >= best.score:
                     best = draft
 

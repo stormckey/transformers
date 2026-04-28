@@ -326,6 +326,17 @@ class GenerationConfig(PushToHubMixin):
         suffix_decoding_cache (`SuffixDecodingCache`, *optional*):
             A persistent cache object for cross-request suffix reuse. When provided, the suffix tree accumulates
             response patterns from prior requests and uses them to improve speculation for future requests.
+        tree_spec_decoding_num_tokens (`int`, *optional*):
+            The maximum number of flattened draft-tree tokens to verify using tree-based suffix speculative decoding.
+            Setting this activates tree-based assisted generation.
+        tree_spec_decoding_max_depth (`int`, *optional*):
+            The maximum suffix-tree depth used by tree-based suffix speculative decoding. Defaults to 64.
+        tree_spec_decoding_min_prob (`float`, *optional*):
+            Minimum probability threshold for tree path expansion. Defaults to 0.1.
+        tree_spec_decoding_branch_factor (`int`, *optional*):
+            Maximum number of continuation branches expanded from each suffix-tree node. Defaults to 2.
+        tree_spec_decoding_cache (`SuffixDecodingCache`, *optional*):
+            A persistent suffix cache object used by tree-based suffix speculative decoding.
         assistant_early_exit(`int`, *optional*):
             If set to a positive integer, early exit of the model will be used as an assistant. Can only be used with
             models that support early exit (i.e. models where logits from intermediate layers can be interpreted by the LM head).
@@ -436,6 +447,11 @@ class GenerationConfig(PushToHubMixin):
         self.suffix_decoding_max_depth = kwargs.pop("suffix_decoding_max_depth", None)
         self.suffix_decoding_min_prob = kwargs.pop("suffix_decoding_min_prob", None)
         self.suffix_decoding_cache = kwargs.pop("suffix_decoding_cache", None)
+        self.tree_spec_decoding_num_tokens = kwargs.pop("tree_spec_decoding_num_tokens", None)
+        self.tree_spec_decoding_max_depth = kwargs.pop("tree_spec_decoding_max_depth", None)
+        self.tree_spec_decoding_min_prob = kwargs.pop("tree_spec_decoding_min_prob", None)
+        self.tree_spec_decoding_branch_factor = kwargs.pop("tree_spec_decoding_branch_factor", None)
+        self.tree_spec_decoding_cache = kwargs.pop("tree_spec_decoding_cache", None)
         self.assistant_early_exit = kwargs.pop("assistant_early_exit", None)
         self.assistant_lookbehind = kwargs.pop("assistant_lookbehind", None)
         self.target_lookbehind = kwargs.pop("target_lookbehind", None)
@@ -540,6 +556,7 @@ class GenerationConfig(PushToHubMixin):
             or self.prompt_lookup_num_tokens is not None
             or self.assistant_early_exit is not None
             or self.suffix_decoding_num_tokens is not None
+            or self.tree_spec_decoding_num_tokens is not None
         ):
             if generation_mode in ("greedy_search", "sample"):
                 generation_mode = GenerationMode.ASSISTED_GENERATION
