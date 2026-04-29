@@ -3552,15 +3552,27 @@ class GenerationMixin(ContinuousMixin):
             # we use this forward pass to also pick the subsequent logits in the original model.
 
             # 2.1. Prepare the model inputs
+            tree_uses_incremental_cache = False
             if tree_draft is not None:
-                candidate_kwargs = _prepare_tree_spec_model_kwargs(
+                incremental_tree_inputs, _ = _prepare_tree_spec_incremental_model_kwargs(
                     model_kwargs,
                     input_ids,
                     candidate_input_ids,
                     tree_draft,
                     getattr(self, "dtype", torch.float32),
                 )
-                next_sequence_length = None
+                if incremental_tree_inputs is not None:
+                    candidate_kwargs, next_sequence_length = incremental_tree_inputs
+                    tree_uses_incremental_cache = True
+                else:
+                    candidate_kwargs = _prepare_tree_spec_model_kwargs(
+                        model_kwargs,
+                        input_ids,
+                        candidate_input_ids,
+                        tree_draft,
+                        getattr(self, "dtype", torch.float32),
+                    )
+                    next_sequence_length = None
             else:
                 candidate_kwargs = copy.copy(model_kwargs)
                 candidate_kwargs = _prepare_attention_mask(
@@ -3608,6 +3620,43 @@ class GenerationMixin(ContinuousMixin):
                     do_sample,
                     is_done_candidate,
                 )
+                # Have cache but not match -> root miss
+                if tree_uses_incremental_cache and n_matches == 0:
+                    candidate_kwargs = _prepare_tree_spec_model_kwargs(
+                        model_kwargs,
+                        input_ids,
+                        candidate_input_ids,
+                        tree_draft,
+                        getattr(self, "dtype", torch.float32),
+                    )
+                    model_inputs = self.prepare_inputs_for_generation(
+                        candidate_input_ids,
+                        next_sequence_length=None,
+                        is_first_iteration=is_first_iteration,
+                        **candidate_kwargs,
+                    )
+                    if "logits_to_keep" in model_inputs:
+                        model_inputs["logits_to_keep"] = candidate_length + 1
+
+                    outputs = self(**model_inputs)
+                    new_logits = outputs.logits[:, -candidate_length - 1 :].to(
+                        dtype=torch.float32, device=input_ids.device
+                    )
+                    next_token_logits = new_logits.clone()
+                    if len(logits_processor) > 0:
+                        for i in range(candidate_length + 1):
+                            new_logits[:, i, :] = logits_processor(
+                                candidate_input_ids[:, : cur_len + i], new_logits[:, i, :]
+                            )
+
+                    valid_tokens, n_matches, tree_logits_indices = _tree_spec_acceptance(
+                        candidate_input_ids,
+                        new_logits,
+                        tree_draft,
+                        do_sample,
+                        is_done_candidate,
+                    )
+                    tree_uses_incremental_cache = False
             elif do_sample and candidate_logits is not None:
                 valid_tokens, n_matches = _speculative_sampling(
                     candidate_input_ids,
@@ -3648,7 +3697,7 @@ class GenerationMixin(ContinuousMixin):
             num_added_tokens = valid_tokens.shape[-1]
 
             # 4.2. Discard past key values relative to unused assistant tokens
-            if tree_draft is None:
+            if tree_draft is None or tree_uses_incremental_cache:
                 outputs.past_key_values.crop(new_cur_len - 1)
 
             # 5. Update the candidate generation strategy if needed
@@ -3661,7 +3710,7 @@ class GenerationMixin(ContinuousMixin):
                 is_encoder_decoder=self.config.is_encoder_decoder,
                 num_new_tokens=num_added_tokens,
             )
-            if tree_draft is not None:
+            if tree_draft is not None and not tree_uses_incremental_cache:
                 for cache_name in ALL_CACHE_NAMES:
                     model_kwargs.pop(cache_name, None)
             if synced_gpus and this_peer_finished:
@@ -3972,6 +4021,150 @@ def _prepare_tree_spec_model_kwargs(
     candidate_kwargs["position_ids"] = full_position_ids
 
     return candidate_kwargs
+
+
+def _infer_kv_cache_length(model_kwargs: dict[str, Any]) -> int | None:
+    """Best-effort helper to read the runtime KV cache length from model kwargs.
+    
+    Due to some tree base operations, input_ids.shape[1], the number of accepted tokens 
+    is not the same as cache length, we need a new way to find the real cache in runtime.
+    """
+    cache = None
+    for cache_name in ALL_CACHE_NAMES:
+        if cache_name in model_kwargs:
+            cache = model_kwargs[cache_name]
+            break
+
+    if cache is None:
+        return None
+    # Try its API
+    if hasattr(cache, "get_seq_length"):
+        try:
+            seq_len = cache.get_seq_length()
+            if seq_len is not None:
+                return int(seq_len)
+        except Exception:
+            pass
+    # Try key_cache shape
+    if hasattr(cache, "key_cache"):
+        try:
+            key_cache = cache.key_cache
+            if key_cache:
+                return int(key_cache[0].shape[-2])
+        except Exception:
+            pass
+    # Try retrieve shape from tuple cache
+    if isinstance(cache, (list, tuple)) and len(cache) > 0:
+        first_layer = cache[0]
+        if isinstance(first_layer, (list, tuple)) and len(first_layer) > 0:
+            try:
+                return int(first_layer[0].shape[-2])
+            except Exception:
+                pass
+
+    return None
+
+
+def _prepare_tree_spec_incremental_model_kwargs(
+    model_kwargs: dict[str, Any],
+    input_ids: torch.LongTensor,
+    candidate_input_ids: torch.LongTensor,
+    tree_draft: Any,
+    dtype: torch.dtype,
+) -> tuple[tuple[dict[str, Any], int] | None, str | None]:
+    """Build cache-aware incremental kwargs for a flattened tree draft.
+
+    This reuses the existing generation cache and verifies:
+    - query row 0: the last accepted prefix token, whose logits decide the tree root
+    - query rows 1..N: the flattened tree draft tokens, whose logits decide descendants
+    """
+    # Tree only support batch size = 1
+    batch_size, cur_len = input_ids.shape
+    if batch_size != 1:
+        return None, "batch_size"
+
+    draft_len = candidate_input_ids.shape[1] - cur_len
+    if draft_len <= 0:
+        return None, "empty_draft"
+
+    kv_prefix_length = _infer_kv_cache_length(model_kwargs)
+    if kv_prefix_length is None:
+        return None, "no_cache"
+
+    # We need to calculate the difference between logically accepted tokens and tokens in cache
+    # For some reason there is mismatch therefore we have to do cache length inference
+    uncached_prefix_len = cur_len - kv_prefix_length
+    if uncached_prefix_len <= 0:
+        return None, "cache_length_mismatch"
+
+    total_len = candidate_input_ids.shape[1]
+    query_len = uncached_prefix_len + draft_len
+    device = candidate_input_ids.device
+
+    candidate_kwargs = copy.copy(model_kwargs)
+    candidate_kwargs = _prepare_token_type_ids(candidate_kwargs, total_len)
+
+    attention_mask_2d = model_kwargs.get("attention_mask")
+    if attention_mask_2d is None:
+        prompt_mask = torch.ones((kv_prefix_length,), dtype=torch.bool, device=device)
+    else:
+        prompt_mask = attention_mask_2d[0, :kv_prefix_length].to(device=device, dtype=torch.bool)
+
+    mask_dtype = dtype if dtype.is_floating_point else torch.float32
+    min_dtype = torch.finfo(mask_dtype).min
+    # Mask consists of replayed prefix (kv_prefix_length) and draft
+    tree_mask = torch.full(
+        (1, 1, query_len, kv_prefix_length + query_len),
+        min_dtype,
+        dtype=mask_dtype,
+        device=device,
+    )
+
+    # Prefix-tail query block: replay any accepted prefix tokens that are not yet present in the cache.
+    for query_idx in range(uncached_prefix_len):
+        tree_mask[0, 0, query_idx, :kv_prefix_length] = torch.where(
+            prompt_mask,
+            torch.zeros((), dtype=mask_dtype, device=device),
+            torch.full((), min_dtype, dtype=mask_dtype, device=device),
+        )
+        tree_mask[0, 0, query_idx, kv_prefix_length : kv_prefix_length + query_idx + 1] = 0
+
+    # Calculate the chain of ancestor for masking
+    ancestors: list[list[int]] = []
+    for draft_idx in range(draft_len):
+        parent = tree_draft.parents[draft_idx]
+        node_ancestors = [] if parent == -1 else [*ancestors[parent], parent]
+        ancestors.append(node_ancestors)
+
+        query_idx = uncached_prefix_len + draft_idx
+        tree_mask[0, 0, query_idx, :kv_prefix_length] = torch.where(
+            prompt_mask,
+            torch.zeros((), dtype=mask_dtype, device=device),
+            torch.full((), min_dtype, dtype=mask_dtype, device=device),
+        )
+        # Every draft token can see all replayed prefix-tail query rows.
+        tree_mask[0, 0, query_idx, kv_prefix_length : kv_prefix_length + uncached_prefix_len] = 0
+        for ancestor in node_ancestors:
+            tree_mask[0, 0, query_idx, kv_prefix_length + uncached_prefix_len + ancestor] = 0
+        tree_mask[0, 0, query_idx, kv_prefix_length + query_idx] = 0
+
+    candidate_kwargs["attention_mask"] = tree_mask
+
+    position_ids = model_kwargs.get("position_ids")
+    if position_ids is None:
+        query_position_ids = torch.empty((1, query_len), dtype=torch.long, device=device)
+        prefix_tail_positions = torch.arange(kv_prefix_length, cur_len, dtype=torch.long, device=device)
+    else:
+        query_position_ids = torch.empty((1, query_len), dtype=position_ids.dtype, device=device)
+        prefix_tail_positions = position_ids[0, kv_prefix_length:cur_len].to(device)
+
+    query_position_ids[0, :uncached_prefix_len] = prefix_tail_positions
+    root_position = prefix_tail_positions[-1]
+    for draft_idx, depth in enumerate(tree_draft.depths):
+        query_position_ids[0, uncached_prefix_len + draft_idx] = root_position + depth
+    candidate_kwargs["position_ids"] = query_position_ids
+
+    return (candidate_kwargs, query_len), None
 
 
 def _tree_spec_acceptance(
