@@ -20,6 +20,8 @@ This fork's `suffix-decoding` branch integrates suffix-tree-based speculative ca
 
 My implementation work covers the core suffix tree, the `SuffixDecodingCandidateGenerator`, generation-pipeline integration, cross-request caching, and cache-eviction fixes. See the [project commits](https://github.com/stormckey/transformers/commits/suffix-decoding/?author=stormckey) for the attributed history.
 
+The companion [`sd-bench`](https://github.com/stormckey/sd-bench) repository provides the Modal benchmark harness, pinned implementation revisions, historical L40S results, and no-GPU configuration and adapter tests.
+
 The remainder of this document is the upstream Hugging Face Transformers README.
 
 ---
