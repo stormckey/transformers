@@ -14,6 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
+# Suffix Decoding for Transformers
+
+This fork's `suffix-decoding` branch integrates suffix-tree-based speculative candidate generation into the Hugging Face Transformers generation pipeline. The implementation adds an online compressed suffix tree over prompt and accepted tokens, generation configuration and candidate-generator integration, and a bounded cross-request cache for reusing suffix matches across generation calls.
+
+My implementation work covers the core suffix tree, the `SuffixDecodingCandidateGenerator`, generation-pipeline integration, cross-request caching, and cache-eviction fixes. See the [project commits](https://github.com/stormckey/transformers/commits/suffix-decoding/?author=stormckey) for the attributed history.
+
+The remainder of this document is the upstream Hugging Face Transformers README.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://huggingface.co/datasets/huggingface/documentation-images/raw/main/transformers-logo-dark.svg">
