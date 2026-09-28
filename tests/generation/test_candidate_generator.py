@@ -13,7 +13,11 @@ from transformers.generation.candidate_generator import (
     UniversalSpeculativeDecodingGenerator,
 )
 from transformers.generation.suffix_tree import SuffixDecodingDraft, SuffixTree
-from transformers.generation.utils import _tree_spec_acceptance
+from transformers.generation.utils import (
+    _compact_tree_spec_cache,
+    _prepare_tree_spec_inputs,
+    _tree_spec_acceptance,
+)
 from transformers.testing_utils import require_torch, torch_device
 
 
@@ -48,23 +52,72 @@ class TestTreeSpecDecoding(unittest.TestCase):
 
     def test_tree_spec_acceptance_follows_matching_branch(self):
         draft = SuffixDecodingDraft(token_ids=[5, 6, 7], parents=[-1, -1, 0], depths=[1, 1, 2])
-        candidate_input_ids = torch.tensor([[1, 2, 5, 6, 7]])
         logits = torch.zeros((1, 4, 10))
         logits[0, 0, 5] = 1
         logits[0, 1, 7] = 1
         logits[0, 3, 9] = 1
 
-        valid_tokens, num_matches, logits_indices = _tree_spec_acceptance(
-            candidate_input_ids,
-            logits,
-            draft,
-            do_sample=False,
-            is_done_candidate=False,
+        valid_tokens, num_matches, logits_indices, accepted_nodes = _tree_spec_acceptance(
+            logits, draft, do_sample=False
         )
 
         self.assertEqual(valid_tokens.tolist(), [[5, 7, 9]])
         self.assertEqual(num_matches, 2)
         self.assertEqual(logits_indices, [0, 1, 3])
+        self.assertEqual(accepted_nodes, [0, 2])
+
+    def _tiny_model(self):
+        config = AutoConfig.for_model(
+            "llama",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+        torch.manual_seed(0)
+        return AutoModelForCausalLM.from_config(config, attn_implementation="sdpa").eval()
+
+    def test_tree_verification_matches_per_branch_forward(self):
+        # a tree with interleaved branches: 0 -> 2 -> 4 and 1 -> 3, plus a second root child
+        model = self._tiny_model()
+        draft = SuffixDecodingDraft(
+            token_ids=[10, 11, 12, 13, 14, 15], parents=[-1, -1, 0, 1, 2, -1], depths=[1, 1, 2, 2, 3, 1]
+        )
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7]])
+        with torch.no_grad():
+            # warm the cache with all but the last accepted token, as the assisted decoding loop does
+            outputs = model(input_ids[:, :-1], use_cache=True)
+            model_kwargs = {"past_key_values": outputs.past_key_values}
+            tree_logits = model(**_prepare_tree_spec_inputs(model_kwargs, input_ids, draft, torch.float32)).logits
+
+            # every row must match an independent forward over the node's own root-to-node path
+            paths = [[]]
+            for node, parent in enumerate(draft.parents):
+                paths.append(paths[parent + 1] + [draft.token_ids[node]])
+            for row, path in enumerate(paths):
+                expected = model(torch.cat([input_ids, torch.tensor([path], dtype=torch.long)], dim=-1)).logits
+                torch.testing.assert_close(tree_logits[0, row], expected[0, -1], rtol=1e-4, atol=1e-4)
+
+    def test_compact_tree_cache_keeps_accepted_branch(self):
+        model = self._tiny_model()
+        draft = SuffixDecodingDraft(token_ids=[10, 11, 12, 13], parents=[-1, -1, 1, 0], depths=[1, 1, 2, 2])
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        accepted_nodes = [1, 2]  # not a prefix of the flattened order
+        with torch.no_grad():
+            outputs = model(input_ids[:, :-1], use_cache=True)
+            cache = outputs.past_key_values
+            model(**_prepare_tree_spec_inputs({"past_key_values": cache}, input_ids, draft, torch.float32))
+            _compact_tree_spec_cache(cache, input_ids.shape[1], accepted_nodes)
+
+            accepted_ids = torch.tensor([[1, 2, 3, 4, 5, 11, 12]])
+            reference = model(accepted_ids, use_cache=True).past_key_values
+
+        self.assertEqual(cache.get_seq_length(), accepted_ids.shape[1])
+        for layer, ref_layer in zip(cache.layers, reference.layers):
+            torch.testing.assert_close(layer.keys, ref_layer.keys, rtol=1e-4, atol=1e-4)
+            torch.testing.assert_close(layer.values, ref_layer.values, rtol=1e-4, atol=1e-4)
 
 
 @require_torch
