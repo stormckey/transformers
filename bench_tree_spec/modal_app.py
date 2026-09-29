@@ -61,12 +61,22 @@ def _methods():
             "tree_spec_decoding_max_spec_factor": 1e9,
             "tree_spec_decoding_max_spec_offset": 1e9,
         },
+        "tree_big": lambda: {
+            "tree_spec_decoding_num_tokens": 256,
+            "tree_spec_decoding_branch_factor": 16,
+            "tree_spec_decoding_min_prob": 0.01,
+            "tree_spec_decoding_max_spec_factor": 1e9,
+            "tree_spec_decoding_max_spec_offset": 1e9,
+        },
         "tree_b4_n64_p02": lambda: {
             "tree_spec_decoding_num_tokens": 64,
             "tree_spec_decoding_branch_factor": 4,
             "tree_spec_decoding_min_prob": 0.02,
         },
     }
+    # `<method>_fold`: same kwargs, but masked GQA attention folds query heads instead of repeating K/V
+    for name in list(methods):
+        methods[f"{name}_fold"] = methods[name]
     # cross-request variants: one persistent cache per method, shared across the prompts of a task
     caches = {
         "suffix_global": SuffixDecodingCache(max_depth=64, max_cached_requests=64),
@@ -130,7 +140,11 @@ class _Probe:
         model.register_forward_pre_hook(self._on_forward)
 
         probe = self
-        for cls in (cg.PromptLookupCandidateGenerator, cg.SuffixDecodingCandidateGenerator):
+        for cls in (
+            cg.PromptLookupCandidateGenerator,
+            cg.SuffixDecodingCandidateGenerator,
+            cg.TreeSpecDecodingCandidateGenerator,
+        ):
             orig = cls.get_candidates
 
             def timed(gen, input_ids, _orig=orig):
@@ -139,7 +153,8 @@ class _Probe:
                 probe.draft_time += time.perf_counter() - t0
                 n_draft = out[0].shape[1] - input_ids.shape[1]
                 probe.proposed += n_draft
-                probe.tree_steps += int(getattr(gen, "tree_draft", None) is not None)
+                draft = getattr(gen, "tree_draft", None)
+                probe.tree_steps += int(draft is not None and draft.is_tree)
                 return out
 
             cls.get_candidates = timed
@@ -187,7 +202,12 @@ def run_task(task: str, n: int, model_id: str, max_new_tokens: int, method_names
     prompts = _load_prompts(task, n, tokenizer)
     gen_kwargs = {"max_new_tokens": max_new_tokens, "do_sample": False, "pad_token_id": tokenizer.eos_token_id}
 
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    sdpa_default, sdpa_fold = ALL_ATTENTION_FUNCTIONS["sdpa"], _sdpa_variant("fold_heads")
+
     def run_one(prompt, name):
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_fold if name.endswith("_fold") else sdpa_default
         inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
         probe.reset()
         torch.cuda.synchronize()
@@ -353,3 +373,172 @@ def main(
             print("TASK FAILED:", repr(r))
     out_path.write_text(json.dumps(ok))
     print("wrote", out_path)
+
+
+@app.function(gpu=GPU, volumes={"/hf": hf_cache}, timeout=1800)
+def cprofile_steps(model_id: str = "Qwen/Qwen3-8B", max_new_tokens: int = 256):
+    """Host-side time breakdown (cProfile) of one generate call per method; the loop is CPU/launch bound."""
+    import cProfile
+    import io
+    import pstats
+
+    import torch
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation="sdpa")
+    model = model.to("cuda").eval()
+    prompt = _load_prompts("chat", 1, tokenizer, offset=45)[0]
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    methods = _methods()
+    report = {}
+    for name in ("vanilla", "suffix", "tree_new"):
+        gen = {"max_new_tokens": max_new_tokens, "do_sample": False, "pad_token_id": tokenizer.eos_token_id}
+        gen.update(methods[name]())
+        with torch.inference_mode():
+            model.generate(**inputs, **gen)
+            torch.cuda.synchronize()
+            prof = cProfile.Profile()
+            prof.enable()
+            out = model.generate(**inputs, **gen)
+            torch.cuda.synchronize()
+            prof.disable()
+        buf = io.StringIO()
+        stats = pstats.Stats(prof, stream=buf)
+        stats.sort_stats("tottime").print_stats(35)
+        loop = "_assisted_decoding" if name != "vanilla" else "_sample"
+        stats.sort_stats("cumulative").print_callees(loop)
+        report[name] = {"new_tokens": out.shape[1] - inputs.input_ids.shape[1], "text": buf.getvalue()}
+        print(f"=== {name}", report[name]["new_tokens"], flush=True)
+        print(buf.getvalue(), flush=True)
+    return report
+
+
+@app.local_entrypoint()
+def cprof():
+    report = cprofile_steps.remote()
+    Path("bench_tree_spec/results/cprofile.json").write_text(json.dumps(report))
+
+
+def _sdpa_variant(kind: str):
+    """Alternative SDPA wrappers for masked GQA attention (tree verification always passes a 4D mask)."""
+    import torch
+
+    from transformers.integrations import sdpa_attention as sa
+
+    def forward(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
+        if attention_mask is None or not hasattr(module, "num_key_value_groups"):
+            return sa.sdpa_attention_forward(module, query, key, value, attention_mask, dropout, scaling, is_causal)
+        n_rep = module.num_key_value_groups
+        if kind == "gqa_flag":
+            out = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, scale=scaling, enable_gqa=True
+            )
+        elif kind == "fold_heads":
+            b, hq, q, d = query.shape
+            hkv = key.shape[1]
+            folded = query.reshape(b, hkv, n_rep * q, d)
+            mask = attention_mask.expand(b, 1, q, -1).repeat(1, 1, n_rep, 1)
+            out = torch.nn.functional.scaled_dot_product_attention(folded, key, value, attn_mask=mask, scale=scaling)
+            out = out.reshape(b, hq, q, d)
+        else:
+            raise ValueError(kind)
+        return out.transpose(1, 2).contiguous(), None
+
+    return forward
+
+
+@app.function(gpu=GPU, volumes={"/hf": hf_cache}, timeout=1800)
+def attn_variants(model_id: str = "Qwen/Qwen3-8B"):
+    import torch
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation="sdpa")
+    model = model.to("cuda").eval()
+    original = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    variants = {
+        "repeat_kv": original,
+        "gqa_flag": _sdpa_variant("gqa_flag"),
+        "fold_heads": _sdpa_variant("fold_heads"),
+    }
+    report = {}
+
+    # 1. wall time per forward, q draft tokens on top of a 1200-token cache, tree-style 4D mask
+    ctx = 1200
+    prefix = torch.randint(0, 1000, (1, ctx), device="cuda")
+    for q in (1, 17, 65, 129):
+        for name, fn in list(variants.items()) + [("no_mask", original)]:
+            ALL_ATTENTION_FUNCTIONS["sdpa"] = fn
+            with torch.inference_mode():
+                cache = DynamicCache(config=model.config)
+                model(prefix, past_key_values=cache, use_cache=True)
+                x = torch.randint(0, 1000, (1, q), device="cuda")
+                mask = torch.zeros((1, 1, q, ctx + q), dtype=torch.bfloat16, device="cuda")
+                mask[..., ctx:] = torch.full((q, q), torch.finfo(torch.bfloat16).min, device="cuda").triu(1)
+                kw = {} if name == "no_mask" else {"attention_mask": mask}
+                times = []
+                for _ in range(15):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    model(x, past_key_values=cache, use_cache=True, logits_to_keep=q, **kw)
+                    torch.cuda.synchronize()
+                    times.append(1000 * (time.perf_counter() - t0))
+                    cache.crop(ctx)
+                # check the variant is exact against the reference repeat_kv path
+            report[f"q{q}_{name}"] = sorted(times[3:])[len(times[3:]) // 2]
+            print(f"q={q:<4} {name:<11} {report[f'q{q}_{name}']:.2f} ms", flush=True)
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = original
+
+    # 2. numerical check of the variants against repeat_kv on a tree mask
+    with torch.inference_mode():
+        x = torch.randint(0, 1000, (1, 65), device="cuda")
+        mask = torch.zeros((1, 1, 65, ctx + 65), dtype=torch.bfloat16, device="cuda")
+        mask[..., ctx:] = torch.full((65, 65), torch.finfo(torch.bfloat16).min, device="cuda").triu(1)
+        outs = {}
+        for name, fn in variants.items():
+            ALL_ATTENTION_FUNCTIONS["sdpa"] = fn
+            cache = DynamicCache(config=model.config)
+            model(prefix, past_key_values=cache, use_cache=True)
+            outs[name] = model(x, attention_mask=mask, past_key_values=cache).logits.float()
+        for name in variants:
+            diff = (outs[name] - outs["repeat_kv"]).abs().max().item()
+            agree = (outs[name].argmax(-1) == outs["repeat_kv"].argmax(-1)).float().mean().item()
+            report[f"diff_{name}"] = diff
+            print(f"{name}: max|dlogit| {diff:.4f}  argmax agree {agree:.3f}", flush=True)
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = original
+
+    # 3. end to end, tree_new on 5 chat prompts
+    methods = _methods()
+    prompts = _load_prompts("chat", 5, tokenizer, offset=50)
+    probe = _Probe(model)
+    for name in ("repeat_kv", "gqa_flag", "fold_heads"):
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = variants[name]
+        lat = fwd = 0
+        for i, prompt in enumerate(prompts):
+            inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+            gen = dict(
+                max_new_tokens=256, do_sample=False, pad_token_id=tokenizer.eos_token_id, **methods["tree_new"]()
+            )
+            with torch.inference_mode():
+                if i == 0:
+                    model.generate(**inputs, **gen)
+                probe.reset()
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                model.generate(**inputs, **gen)
+                torch.cuda.synchronize()
+                lat += time.perf_counter() - t0
+                fwd += probe.forwards
+        report[f"e2e_{name}_ms_per_fwd"] = 1000 * lat / fwd
+        print(f"e2e tree_new with {name}: {1000 * lat / fwd:.2f} ms/forward", flush=True)
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = original
+    return report
+
+
+@app.local_entrypoint()
+def attn():
+    Path("bench_tree_spec/results/attn_variants.json").write_text(json.dumps(attn_variants.remote()))

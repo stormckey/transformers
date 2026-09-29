@@ -124,6 +124,10 @@ POLICIES = {
     "merged_b4_n64_p05_nocap_m2": tree_merged(min_prob=0.05, factor=1e9, offset=1e9, max_matches=2),
     "merged_b8_n128_p02_nocap": tree_merged(n=128, branch=8, min_prob=0.02, factor=1e9, offset=1e9),
     "tree_b8_n128_p02_nocap": tree_best(n=128, branch=8, min_prob=0.02, factor=1e9, offset=1e9),
+    "tree_b8_n128_p01_nocap": tree_best(n=128, branch=8, min_prob=0.01, factor=1e9, offset=1e9),
+    "tree_b16_n256_p01_nocap": tree_best(n=256, branch=16, min_prob=0.01, factor=1e9, offset=1e9),
+    "tree_b8_n256_p005_nocap": tree_best(n=256, branch=8, min_prob=0.005, factor=1e9, offset=1e9),
+    "tree_b8_n128_p02_depth32": tree_best(n=128, branch=8, min_prob=0.02, factor=1e9, offset=1e9),
 }
 
 

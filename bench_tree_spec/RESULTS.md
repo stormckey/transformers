@@ -1,32 +1,52 @@
 # Tree-spec vs suffix decoding — Qwen3-8B, H100
 
-Raw data: `results/qwen3-8b-h100.json` (run with `modal run bench_tree_spec/modal_app.py --n 30 --max-new-tokens 384`).
+Setup: bf16, SDPA, greedy, batch size 1, 30 test prompts per task (same prompts in every run), max 384 new tokens.
+Every prompt runs all methods back to back in one container with the method order rotated per prompt; speedup is the
+geometric mean over prompts of vanilla latency / method latency, and method-vs-method numbers are paired per prompt
+(95% bootstrap CI).
 
-Setup: bf16, SDPA, greedy, batch size 1, 30 prompts per task, every prompt runs all methods back to back in one
-container (method order rotated per prompt). Speedup = geometric mean over prompts of vanilla latency / method latency.
+## Final numbers (`results/qwen3-8b-h100-v3.json`)
 
-| task | vanilla tok/s | PLD | suffix (linear) | tree b4 n64 | tree vs suffix (paired, 95% CI) |
+| task | PLD | suffix (linear) | tree, old policy (run 1) | **tree_new** | tree_new vs suffix |
 |---|---|---|---|---|---|
-| code_edit (CanItEdit) | 43.6 | 3.90x | 6.60x | **7.28x** | 1.10x [1.07, 1.14] |
-| humaneval | 36.3 | 1.73x | 1.89x | **1.97x** | 1.04x [1.00, 1.10] |
-| gsm8k | 54.8 | 1.41x | 1.43x | **1.52x** | 1.06x [1.05, 1.08] |
-| chat (MT-Bench) | 40.3 | 1.11x | 1.14x | **1.18x** | 1.04x [1.01, 1.07] |
-| all | 42.4 | 1.80x | 2.12x | **2.25x** | 1.06x [1.04, 1.08] |
+| code_edit (CanItEdit) | 3.90x | 6.48x | 7.28x | **8.76x** | 1.36x |
+| humaneval | 1.72x | 1.87x | 1.97x | **1.94x** | 1.05x |
+| gsm8k | 1.44x | 1.45x | 1.52x | **1.58x** | 1.10x |
+| chat (MT-Bench) | 1.13x | 1.16x | 1.18x | **1.14x** | 0.98x |
+| all | 1.79x | 2.12x | 2.25x | **2.36x** | **1.11x [1.08, 1.15]** |
 
-Findings
+`tree_new` = `tree_spec_decoding_num_tokens=128, branch_factor=8, min_prob=0.02, max_spec_factor=max_spec_offset=1e9`.
+The tree_new/suffix ratio reproduced exactly across two independent runs (v2: 1.112x, v3: 1.113x).
 
-- Tree verification costs nothing extra per step: ms per target forward is the same for linear suffix and tree drafts
-  up to 64 nodes (e.g. code_edit 27.3 vs 27.2 ms). An 8B model at batch size 1 is memory-bound, so the extra draft
-  tokens are free.
-- The gain is limited by the drafts: only ~30% of steps actually produce a branching draft, and tokens per forward
-  rises by 2-8% over linear suffix. Speedup follows tokens per forward almost one to one.
-- Wider/bigger trees help (b4 n64 > b4 n32 > b2 n32); b2 n16 is worse than linear suffix n32 on code_edit because it
-  caps the draft length. Lowering `min_prob` to 0.02 changes nothing — the `match_len * 3 + 5` length cap binds first.
-- The cross-request cache (`*_global`) is slower here: it lowers acceptance on these heterogeneous prompts and adds
-  ~0.4 ms of Python draft time per step.
-- Draft time (pure-Python suffix tree) is ~0.8 ms per step, ~3% of a forward.
+## What moved the needle
 
-Correctness: in float32 every method reproduces vanilla greedy exactly (see tests in
-`tests/generation/test_candidate_generator.py`). In bf16 only ~50% of outputs are bit-identical to vanilla for *all*
-speculative methods including upstream PLD — changing the query length changes bf16 reduction order, and greedy
-decoding amplifies near-ties.
+1. **Fixing the KV cache bug** (accepted non-first branches kept rejected tokens' KV). Required for correctness; before
+   the fix tree outputs diverged from greedy on 4/4 test prompts.
+2. **Uncapping draft size.** The suffix-tree draft was capped at `3 * match_len + 5` nodes. A forward of Qwen3-8B on
+   H100 costs the same ~22 ms for 1 or 129 query tokens (launch/CPU bound), so the cap threw away free verification
+   capacity. Policy tuned offline on a disjoint dev split with `simulate.py`, which replays greedy outputs exactly and
+   predicted the measured tokens/forward within ~3%.
+
+## What did not
+
+- Larger trees (256 nodes, branch 16): +0.9% (n.s.). Drafting from the suffix tree is saturated — the true
+  continuation usually is not in the tree at all.
+- Merging drafts from several match lengths: worse (long matches with count 1 are over-confident).
+- A lean per-step path (no logits-processor pre-filter, host token mirror, one-shot mask build): correct, but no
+  measurable change in ms/step.
+- Folding query heads instead of `repeat_kv` for masked GQA attention: 0.997x (n.s.). A first 5-prompt test showed
+  +7.7%, which was noise.
+- Cross-request (global) suffix cache: slower on these heterogeneous prompts (run 1).
+
+## Where the remaining time goes
+
+Speculative steps cost ~3.5 ms more than vanilla steps (e.g. 26.3 vs 22.2 ms on code_edit) for every method (PLD,
+suffix, tree alike): ~1.5 ms of generation-loop work and ~2 ms more CPU time inside the model forward for q > 1. The
+whole loop is CPU/launch bound (GPU kernels are busy ~50% of wall time in vanilla decoding), so the next big lever is
+CUDA graphs / `torch.compile` for the verification forward — which would also speed up the vanilla baseline and has to
+be reported as such.
+
+Correctness: in float32 all methods reproduce vanilla greedy exactly, with and without logits processors, EOS and
+max-length limits (`tests/generation/test_candidate_generator.py`). In bf16 ~50% of outputs are bit-identical for every
+speculative method including upstream PLD: query length changes bf16 reduction order and greedy decoding amplifies
+near-ties.
