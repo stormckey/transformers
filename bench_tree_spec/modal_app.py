@@ -53,6 +53,14 @@ def _methods():
         "tree_b2_n32": lambda: {"tree_spec_decoding_num_tokens": 32, "tree_spec_decoding_branch_factor": 2},
         "tree_b4_n32": lambda: {"tree_spec_decoding_num_tokens": 32, "tree_spec_decoding_branch_factor": 4},
         "tree_b4_n64": lambda: {"tree_spec_decoding_num_tokens": 64, "tree_spec_decoding_branch_factor": 4},
+        # policy tuned offline on the dev split with bench_tree_spec/simulate.py
+        "tree_new": lambda: {
+            "tree_spec_decoding_num_tokens": 128,
+            "tree_spec_decoding_branch_factor": 8,
+            "tree_spec_decoding_min_prob": 0.02,
+            "tree_spec_decoding_max_spec_factor": 1e9,
+            "tree_spec_decoding_max_spec_offset": 1e9,
+        },
         "tree_b4_n64_p02": lambda: {
             "tree_spec_decoding_num_tokens": 64,
             "tree_spec_decoding_branch_factor": 4,
@@ -76,7 +84,8 @@ def _methods():
     return methods
 
 
-def _load_prompts(task: str, n: int, tokenizer, seed: int = 0) -> list[str]:
+def _load_prompts(task: str, n: int, tokenizer, seed: int = 0, offset: int = 0) -> list[str]:
+    """Returns prompts `offset .. offset + n` of the shuffled task (test set = offset 0, dev set = offset 30)."""
     from datasets import load_dataset
 
     if task == "code_edit":
@@ -106,9 +115,9 @@ def _load_prompts(task: str, n: int, tokenizer, seed: int = 0) -> list[str]:
         # keep prompts reasonably short so one container finishes in bounded time
         if len(tokenizer(text).input_ids) <= 2048:
             prompts.append(text)
-        if len(prompts) == n:
+        if len(prompts) == offset + n:
             break
-    return prompts
+    return prompts[offset:]
 
 
 class _Probe:
@@ -241,6 +250,85 @@ def run_task(task: str, n: int, model_id: str, max_new_tokens: int, method_names
         "max_new_tokens": max_new_tokens,
         "records": records,
     }
+
+
+@app.function(gpu=GPU, volumes={"/hf": hf_cache}, timeout=3600)
+def dump_vanilla(task: str, n: int, offset: int, model_id: str, max_new_tokens: int):
+    """Greedy vanilla outputs, used to replay drafting policies offline (greedy output does not depend on drafts)."""
+    import torch
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation="sdpa")
+    model = model.to("cuda").eval()
+    rows = []
+    for prompt in _load_prompts(task, n, tokenizer, offset=offset):
+        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id
+            )
+        rows.append({"prompt": inputs.input_ids[0].tolist(), "output": out[0, inputs.input_ids.shape[1] :].tolist()})
+    return {"task": task, "rows": rows}
+
+
+@app.function(gpu=GPU, volumes={"/hf": hf_cache}, timeout=3600)
+def profile(model_id: str):
+    """Forward latency vs query length, and a torch.profiler trace of the suffix decoding loop."""
+    import torch
+    from torch.profiler import ProfilerActivity
+    from torch.profiler import profile as tprofile
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, attn_implementation="sdpa")
+    model = model.to("cuda").eval()
+    report = {}
+
+    # 1. pure forward time vs query length on top of a cache
+    fwd = {}
+    for ctx in (512, 1536):
+        prefix = torch.randint(0, 1000, (1, ctx), device="cuda")
+        for q in (1, 2, 4, 8, 16, 33, 65, 129):
+            with torch.inference_mode():
+                cache = DynamicCache(config=model.config)
+                model(prefix, past_key_values=cache, use_cache=True)
+                x = torch.randint(0, 1000, (1, q), device="cuda")
+                times = []
+                for _ in range(12):
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    model(x, past_key_values=cache, use_cache=True, logits_to_keep=q)
+                    end.record()
+                    torch.cuda.synchronize()
+                    times.append(start.elapsed_time(end))
+                    cache.crop(ctx)
+            fwd[f"ctx{ctx}_q{q}"] = sorted(times[2:])[len(times[2:]) // 2]
+    report["forward_ms"] = fwd
+    print(json.dumps(fwd, indent=1), flush=True)
+
+    # 2. where does the time of a generate() call go
+    prompt = _load_prompts("code_edit", 1, tokenizer, offset=40)[0]
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    for name, kw in [("vanilla", {}), ("suffix", {"suffix_decoding_num_tokens": 32})]:
+        gen = dict(max_new_tokens=256, do_sample=False, pad_token_id=tokenizer.eos_token_id, **kw)
+        with torch.inference_mode():
+            model.generate(**inputs, **gen)
+            torch.cuda.synchronize()
+            with tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+                t0 = time.perf_counter()
+                model.generate(**inputs, **gen)
+                torch.cuda.synchronize()
+                wall = time.perf_counter() - t0
+        events = prof.key_averages()
+        gpu_busy = sum(e.self_device_time_total for e in events) / 1e6
+        table = events.table(sort_by="cpu_time_total", row_limit=40, max_name_column_width=70)
+        report[name] = {"wall_s": wall, "gpu_kernel_s": gpu_busy, "table": table}
+        print(f"== {name}: wall {wall:.2f}s, gpu kernels {gpu_busy:.2f}s", flush=True)
+        print(table, flush=True)
+    return report
 
 
 @app.local_entrypoint()

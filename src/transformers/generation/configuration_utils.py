@@ -335,6 +335,11 @@ class GenerationConfig(PushToHubMixin):
             Minimum probability threshold for tree path expansion. Defaults to 0.1.
         tree_spec_decoding_branch_factor (`int`, *optional*):
             Maximum number of continuation branches expanded from each suffix-tree node. Defaults to 2.
+        tree_spec_decoding_max_spec_factor (`float`, *optional*):
+            A draft built from a suffix match of length `m` holds at most
+            `m * tree_spec_decoding_max_spec_factor + tree_spec_decoding_max_spec_offset` nodes. Defaults to 3.0.
+        tree_spec_decoding_max_spec_offset (`float`, *optional*):
+            See `tree_spec_decoding_max_spec_factor`. Defaults to 5.0.
         tree_spec_decoding_cache (`SuffixDecodingCache`, *optional*):
             A persistent suffix cache object used by tree-based suffix speculative decoding.
         assistant_early_exit(`int`, *optional*):
@@ -451,6 +456,8 @@ class GenerationConfig(PushToHubMixin):
         self.tree_spec_decoding_max_depth = kwargs.pop("tree_spec_decoding_max_depth", None)
         self.tree_spec_decoding_min_prob = kwargs.pop("tree_spec_decoding_min_prob", None)
         self.tree_spec_decoding_branch_factor = kwargs.pop("tree_spec_decoding_branch_factor", None)
+        self.tree_spec_decoding_max_spec_factor = kwargs.pop("tree_spec_decoding_max_spec_factor", None)
+        self.tree_spec_decoding_max_spec_offset = kwargs.pop("tree_spec_decoding_max_spec_offset", None)
         self.tree_spec_decoding_cache = kwargs.pop("tree_spec_decoding_cache", None)
         self.assistant_early_exit = kwargs.pop("assistant_early_exit", None)
         self.assistant_lookbehind = kwargs.pop("assistant_lookbehind", None)

@@ -11,6 +11,7 @@ from transformers.generation.candidate_generator import (
     AssistantVocabTranslatorCache,
     TreeSpecDecodingCandidateGenerator,
     UniversalSpeculativeDecodingGenerator,
+    _prune_draft_nodes,
 )
 from transformers.generation.suffix_tree import SuffixDecodingDraft, SuffixTree
 from transformers.generation.utils import (
@@ -65,6 +66,16 @@ class TestTreeSpecDecoding(unittest.TestCase):
         self.assertEqual(num_matches, 2)
         self.assertEqual(logits_indices, [0, 1, 3])
         self.assertEqual(accepted_nodes, [0, 2])
+
+    def test_prune_draft_nodes_drops_eos_subtrees(self):
+        # 0:[5] -> 2:[EOS] -> 4:[8] ; 1:[6] -> 3:[7]
+        draft = SuffixDecodingDraft(
+            token_ids=[5, 6, 2, 7, 8], parents=[-1, -1, 0, 1, 2], probs=[1.0] * 5, depths=[1, 1, 2, 2, 3]
+        )
+        pruned = _prune_draft_nodes(draft, {2})
+        self.assertEqual(pruned.token_ids, [5, 6, 7])
+        self.assertEqual(pruned.parents, [-1, -1, 1])
+        self.assertEqual(pruned.depths, [1, 1, 2])
 
     def _tiny_model(self):
         config = AutoConfig.for_model(

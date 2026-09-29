@@ -477,10 +477,7 @@ class SuffixDecodingCache:
         source_mode: str = "local_and_global",
     ):
         if source_mode not in {"local_and_global", "local_only", "global_only"}:
-            raise ValueError(
-                "source_mode must be one of: "
-                "'local_and_global', 'local_only', 'global_only'"
-            )
+            raise ValueError("source_mode must be one of: 'local_and_global', 'local_only', 'global_only'")
         self._max_depth = max_depth
         self._max_cached_requests = max_cached_requests
         self._source_mode = source_mode

@@ -971,6 +971,8 @@ class GenerationMixin(ContinuousMixin):
                 max_depth=generation_config.tree_spec_decoding_max_depth or 64,
                 min_prob=generation_config.tree_spec_decoding_min_prob or 0.1,
                 branch_factor=generation_config.tree_spec_decoding_branch_factor or 2,
+                max_spec_factor=generation_config.tree_spec_decoding_max_spec_factor or 3.0,
+                max_spec_offset=generation_config.tree_spec_decoding_max_spec_offset or 5.0,
                 max_length=generation_config.max_length,
                 logits_processor=logits_processor,
                 vocab_size=self.config.get_text_config().vocab_size,
@@ -3546,7 +3548,8 @@ class GenerationMixin(ContinuousMixin):
             tree_draft = getattr(candidate_generator, "tree_draft", None)
 
             candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
-            is_done_candidate = stopping_criteria(candidate_input_ids, None)
+            # the tree path keeps drafts within `max_length` and free of EOS on its own
+            is_done_candidate = stopping_criteria(candidate_input_ids, None) if tree_draft is None else False
 
             # 2. Use the original model to obtain the next token logits given the candidate sequence. We obtain
             # `candidate_length + 1` relevant logits from this process: in the event that all candidates are correct,
@@ -3589,7 +3592,7 @@ class GenerationMixin(ContinuousMixin):
             new_logits = outputs.logits[:, -candidate_length - 1 :].to(
                 dtype=torch.float32, device=input_ids.device
             )  # excludes the input prompt if present
-            next_token_logits = new_logits.clone()
+            next_token_logits = new_logits.clone() if (return_dict_in_generate and output_logits) else None
             if len(logits_processor) > 0:
                 if tree_draft is not None:
                     node_contexts = _tree_spec_node_contexts(input_ids, tree_draft)
@@ -3930,15 +3933,21 @@ def _prepare_tree_spec_inputs(
     query_len = num_prefix + num_draft
     kv_len = cache_len + query_len
 
-    # ancestor-or-self relation between draft nodes, built on CPU (nodes are topologically sorted)
-    ancestors = torch.eye(num_draft, dtype=torch.bool)
+    # ancestor-or-self relation between draft nodes (nodes are topologically sorted), gathered as index pairs on the
+    # host so the mask is built with a handful of device ops whatever the tree size
+    ancestors: list[list[int]] = []
+    rows, cols = [], []
     for node_idx, parent in enumerate(tree_draft.parents):
-        if parent >= 0:
-            ancestors[node_idx] |= ancestors[parent]
+        node_ancestors = (ancestors[parent] if parent >= 0 else []) + [node_idx]
+        ancestors.append(node_ancestors)
+        rows.extend([node_idx] * len(node_ancestors))
+        cols.extend(node_ancestors)
 
     allowed = torch.ones((query_len, kv_len), dtype=torch.bool, device=device)
     allowed[:num_prefix, cache_len:] = torch.ones((num_prefix, query_len), dtype=torch.bool, device=device).tril()
-    allowed[num_prefix:, cur_len:] = ancestors.to(device)
+    draft_block = torch.zeros((num_draft, num_draft), dtype=torch.bool)
+    draft_block[rows, cols] = True
+    allowed[num_prefix:, cur_len:] = draft_block.to(device, non_blocking=True)
 
     attention_mask_2d = model_kwargs.get("attention_mask")
     if attention_mask_2d is not None:

@@ -28,6 +28,7 @@ if is_sklearn_available():
     from sklearn.metrics import roc_curve
 
 from .logits_process import LogitsProcessorList, MinLengthLogitsProcessor, SuppressTokensLogitsProcessor
+from .suffix_tree import SuffixDecodingDraft
 
 
 if TYPE_CHECKING:
@@ -1354,6 +1355,17 @@ class TreeSpecDecodingCandidateGenerator(SuffixDecodingCandidateGenerator):
     but returns a flattened branching draft tree plus parent/depth metadata.
     The generation loop uses that metadata to build a tree attention mask and
     verify multiple continuation branches in one target-model forward pass.
+
+    Every step, including chain-shaped and empty drafts, is exposed through `tree_draft` so that the generation loop
+    always takes the tree verification path. Logits processors are not used to pre-filter the draft: verification
+    applies them on each node's own context, so a forbidden draft token can never be accepted.
+
+    Args:
+        max_spec_factor (`float`, *optional*, defaults to 3.0):
+            A draft built from a suffix match of length `m` holds at most `m * max_spec_factor + max_spec_offset`
+            nodes.
+        max_spec_offset (`float`, *optional*, defaults to 5.0):
+            See `max_spec_factor`.
     """
 
     def __init__(
@@ -1367,6 +1379,8 @@ class TreeSpecDecodingCandidateGenerator(SuffixDecodingCandidateGenerator):
         logits_processor: Optional["LogitsProcessorList"] = None,
         vocab_size: int | None = None,
         suffix_decoding_cache: Any | None = None,
+        max_spec_factor: float = 3.0,
+        max_spec_offset: float = 5.0,
     ):
         super().__init__(
             eos_token_id=eos_token_id,
@@ -1379,23 +1393,70 @@ class TreeSpecDecodingCandidateGenerator(SuffixDecodingCandidateGenerator):
             suffix_decoding_cache=suffix_decoding_cache,
         )
         self.branch_factor = branch_factor
+        self.max_spec_factor = max_spec_factor
+        self.max_spec_offset = max_spec_offset
+        self._eos_token_ids = set(eos_token_id.tolist()) if eos_token_id is not None else set()
+        self._tokens: list[int] = []
 
     def _speculate(self, context: list[int], max_spec_tokens: int):
         """Return a branching suffix draft for the current context."""
+        spec_kwargs = {
+            "context": context,
+            "max_spec_tokens": max_spec_tokens,
+            "min_token_prob": self.min_prob,
+            "branch_factor": self.branch_factor,
+            "max_spec_factor": self.max_spec_factor,
+            "max_spec_offset": self.max_spec_offset,
+        }
         if self._cache is not None and self._req_id is not None:
-            return self._cache.speculate_tree(
-                req_id=self._req_id,
-                context=context,
-                max_spec_tokens=max_spec_tokens,
-                min_token_prob=self.min_prob,
-                branch_factor=self.branch_factor,
-            )
-        return self._tree.speculate_tree(
-            context=context,
-            max_spec_tokens=max_spec_tokens,
-            min_token_prob=self.min_prob,
-            branch_factor=self.branch_factor,
-        )
+            return self._cache.speculate_tree(req_id=self._req_id, **spec_kwargs)
+        return self._tree.speculate_tree(**spec_kwargs)
+
+    def get_candidates(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.FloatTensor]:
+        input_length = input_ids.shape[1]
+
+        # Sync the suffix tree and the host-side token mirror with the newly verified tokens
+        if input_length > self._num_tokens_in_tree:
+            new_tokens = input_ids[0, self._num_tokens_in_tree :].tolist()
+            if self._cache is not None:
+                if self._req_id is None:
+                    self._req_id = self._cache.start_request(new_tokens)
+                else:
+                    self._cache.add_active_response(self._req_id, new_tokens)
+            else:
+                self._tree.extend(self._seq_id, new_tokens)
+            self._tokens.extend(new_tokens)
+            self._num_tokens_in_tree = input_length
+
+        # The target model adds one token on top of the accepted draft path, and a path is never longer than the
+        # number of nodes, so this keeps generation within `max_length`.
+        max_spec = min(self.num_output_tokens, self.max_length - input_length - 1)
+        draft = SuffixDecodingDraft()
+        if max_spec > 0:
+            draft = self._speculate(self._tokens[-self.max_depth :], max_spec)
+            if self._eos_token_ids and not self._eos_token_ids.isdisjoint(draft.token_ids):
+                draft = _prune_draft_nodes(draft, self._eos_token_ids)
+
+        self.tree_draft = draft
+        if not draft.token_ids:
+            return input_ids, None
+        draft_ids = torch.tensor([draft.token_ids], dtype=input_ids.dtype, device=input_ids.device)
+        return torch.cat((input_ids, draft_ids), dim=1), None
+
+
+def _prune_draft_nodes(draft: "SuffixDecodingDraft", banned_tokens: set[int]) -> "SuffixDecodingDraft":
+    """Drops the draft nodes holding a banned token (e.g. EOS) together with their descendants."""
+    kept = SuffixDecodingDraft(score=draft.score, match_len=draft.match_len)
+    new_index = {}
+    for node_idx, (token, parent) in enumerate(zip(draft.token_ids, draft.parents)):
+        if token in banned_tokens or (parent != -1 and parent not in new_index):
+            continue
+        new_index[node_idx] = len(kept.token_ids)
+        kept.token_ids.append(token)
+        kept.parents.append(new_index[parent] if parent != -1 else -1)
+        kept.probs.append(draft.probs[node_idx])
+        kept.depths.append(draft.depths[node_idx])
+    return kept
 
 
 class EarlyExitCandidateGenerator(AssistedCandidateGenerator):
