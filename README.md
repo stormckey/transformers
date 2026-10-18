@@ -20,7 +20,41 @@ This fork's `suffix-decoding` branch integrates suffix-tree-based speculative ca
 
 My implementation work covers the core suffix tree, the `SuffixDecodingCandidateGenerator`, generation-pipeline integration, cross-request caching, and cache-eviction fixes. See the [project commits](https://github.com/stormckey/transformers/commits/suffix-decoding/?author=stormckey) for the attributed history.
 
-The companion [`sd-bench`](https://github.com/stormckey/sd-bench) repository provides the Modal benchmark harness, pinned implementation revisions, historical L40S results, and no-GPU configuration and adapter tests.
+The companion [`sd-bench`](https://github.com/stormckey/sd-bench) repository provides the Modal benchmark harness, pinned implementation revisions, L40S results, and no-GPU configuration and adapter tests.
+
+## Usage
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.generation import SuffixDecodingCache
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", torch_dtype="auto", device_map="auto")
+
+# Optional: share suffix trees across requests (oldest request evicted first).
+cache = SuffixDecodingCache(max_depth=64, max_cached_requests=100)
+
+inputs = tok("Translate to English: Bonjour tout le monde.", return_tensors="pt").to(model.device)
+out = model.generate(
+    **inputs,
+    max_new_tokens=256,
+    do_sample=False,
+    suffix_decoding_num_tokens=10,   # draft length; setting it enables suffix decoding
+    suffix_decoding_cache=cache,     # omit for a per-request tree only
+)
+```
+
+With greedy decoding the output is identical to plain `generate`; drafts are verified by the target model, so suffix
+decoding only changes how many tokens each forward pass can accept. Tuning knobs: `suffix_decoding_max_depth`
+(default 64) and `suffix_decoding_min_prob` (default 0.1).
+
+## Results
+
+On Qwen3-8B with one NVIDIA L40S (batch size 1, greedy, 10 prompts per workload), suffix decoding reached up to
+**1.74×** the throughput of autoregressive decoding (WildChat code) and was the fastest of five methods on 4 of 6
+workloads. Full table, figure, and harness: [`stormckey/sd-bench`](https://github.com/stormckey/sd-bench#results).
+
+---
 
 The remainder of this document is the upstream Hugging Face Transformers README.
 
