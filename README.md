@@ -54,6 +54,14 @@ On Qwen3-8B with one NVIDIA L40S (batch size 1, greedy, 10 prompts per workload)
 **1.74×** the throughput of autoregressive decoding (WildChat code) and was the fastest of five methods on 4 of 6
 workloads. Full table, figure, and harness: [`stormckey/sd-bench`](https://github.com/stormckey/sd-bench#results).
 
+### Follow-up: tree verification fix (September 2026)
+
+Branch [`tree-spec-fix`](https://github.com/stormckey/transformers/tree/tree-spec-fix) fixes a KV-cache bug in the
+team's tree-based verifier (accepting a non-first branch kept rejected tokens' KV) and lifts the draft-size cap. On
+Qwen3-8B / H100 with 30 prompts per task, suffix decoding averaged **2.12×** and the fixed tree variant **2.36×** over
+autoregressive decoding, up to 9.0× on code editing. Details and raw records:
+[`bench_tree_spec/RESULTS.md`](https://github.com/stormckey/transformers/blob/tree-spec-fix/bench_tree_spec/RESULTS.md).
+
 ---
 
 The remainder of this document is the upstream Hugging Face Transformers README.
