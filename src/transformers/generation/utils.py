@@ -29,6 +29,7 @@ from torch import nn
 from ..cache_utils import (
     Cache,
     DynamicCache,
+    DynamicLayer,
     EncoderDecoderCache,
     QuantizedCache,
     StaticCache,
@@ -58,6 +59,7 @@ from .candidate_generator import (
     EarlyExitCandidateGenerator,
     PromptLookupCandidateGenerator,
     SuffixDecodingCandidateGenerator,
+    TreeSpecDecodingCandidateGenerator,
     UniversalSpeculativeDecodingGenerator,
     _prepare_attention_mask,
     _prepare_position_ids,
@@ -959,6 +961,22 @@ class GenerationMixin(ContinuousMixin):
                 model_kwargs=model_kwargs,
                 inputs_tensor=inputs_tensor,
                 logits_processor=logits_processor,
+            )
+        elif generation_config.tree_spec_decoding_num_tokens is not None:
+            if self.config.is_encoder_decoder:
+                raise ValueError("tree-based suffix speculative decoding currently supports decoder-only models.")
+            candidate_generator = TreeSpecDecodingCandidateGenerator(
+                eos_token_id=generation_config._eos_token_tensor,
+                num_output_tokens=generation_config.tree_spec_decoding_num_tokens,
+                max_depth=generation_config.tree_spec_decoding_max_depth or 64,
+                min_prob=generation_config.tree_spec_decoding_min_prob or 0.1,
+                branch_factor=generation_config.tree_spec_decoding_branch_factor or 2,
+                max_spec_factor=generation_config.tree_spec_decoding_max_spec_factor or 3.0,
+                max_spec_offset=generation_config.tree_spec_decoding_max_spec_offset or 5.0,
+                max_length=generation_config.max_length,
+                logits_processor=logits_processor,
+                vocab_size=self.config.get_text_config().vocab_size,
+                suffix_decoding_cache=getattr(generation_config, "tree_spec_decoding_cache", None),
             )
         elif generation_config.suffix_decoding_num_tokens is not None:
             candidate_generator = SuffixDecodingCandidateGenerator(
@@ -3527,34 +3545,43 @@ class GenerationMixin(ContinuousMixin):
             candidate_input_ids = candidate_input_ids.to(self.device)
             if candidate_logits is not None:
                 candidate_logits = candidate_logits.to(self.device)
+            tree_draft = getattr(candidate_generator, "tree_draft", None)
 
             candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
-            is_done_candidate = stopping_criteria(candidate_input_ids, None)
+            # the tree path keeps drafts within `max_length` and free of EOS on its own
+            is_done_candidate = stopping_criteria(candidate_input_ids, None) if tree_draft is None else False
 
             # 2. Use the original model to obtain the next token logits given the candidate sequence. We obtain
             # `candidate_length + 1` relevant logits from this process: in the event that all candidates are correct,
             # we use this forward pass to also pick the subsequent logits in the original model.
 
             # 2.1. Prepare the model inputs
-            candidate_kwargs = copy.copy(model_kwargs)
-            candidate_kwargs = _prepare_attention_mask(
-                candidate_kwargs, candidate_input_ids.shape[1], self.config.is_encoder_decoder
-            )
-            candidate_kwargs = _prepare_token_type_ids(candidate_kwargs, candidate_input_ids.shape[1])
-            if (position_ids := candidate_kwargs.get("position_ids")) is not None and candidate_length > 0:
-                new_length = candidate_length + position_ids.shape[-1]
-                candidate_kwargs = _prepare_position_ids(candidate_kwargs, new_length, self.config.is_encoder_decoder)
+            if tree_draft is not None:
+                # Tree drafts bypass `prepare_inputs_for_generation`: we feed the uncached accepted tokens plus the
+                # flattened tree with a custom 4D tree attention mask and depth-based position ids.
+                model_inputs = _prepare_tree_spec_inputs(model_kwargs, input_ids, tree_draft, self.dtype)
+            else:
+                candidate_kwargs = copy.copy(model_kwargs)
+                candidate_kwargs = _prepare_attention_mask(
+                    candidate_kwargs, candidate_input_ids.shape[1], self.config.is_encoder_decoder
+                )
+                candidate_kwargs = _prepare_token_type_ids(candidate_kwargs, candidate_input_ids.shape[1])
+                if (position_ids := candidate_kwargs.get("position_ids")) is not None and candidate_length > 0:
+                    new_length = candidate_length + position_ids.shape[-1]
+                    candidate_kwargs = _prepare_position_ids(
+                        candidate_kwargs, new_length, self.config.is_encoder_decoder
+                    )
 
-            next_sequence_length = candidate_length + 1 if not is_first_iteration else None
-            model_inputs = self.prepare_inputs_for_generation(
-                candidate_input_ids,
-                next_sequence_length=next_sequence_length,
-                is_first_iteration=is_first_iteration,
-                **candidate_kwargs,
-            )
+                next_sequence_length = candidate_length + 1 if not is_first_iteration else None
+                model_inputs = self.prepare_inputs_for_generation(
+                    candidate_input_ids,
+                    next_sequence_length=next_sequence_length,
+                    is_first_iteration=is_first_iteration,
+                    **candidate_kwargs,
+                )
 
-            if "logits_to_keep" in model_inputs:
-                model_inputs["logits_to_keep"] = candidate_length + 1
+                if "logits_to_keep" in model_inputs:
+                    model_inputs["logits_to_keep"] = candidate_length + 1
 
             # 2.2. Run a forward pass on the candidate sequence
 
@@ -3565,15 +3592,27 @@ class GenerationMixin(ContinuousMixin):
             new_logits = outputs.logits[:, -candidate_length - 1 :].to(
                 dtype=torch.float32, device=input_ids.device
             )  # excludes the input prompt if present
-            next_token_logits = new_logits.clone()
+            next_token_logits = new_logits.clone() if (return_dict_in_generate and output_logits) else None
             if len(logits_processor) > 0:
-                for i in range(candidate_length + 1):
-                    new_logits[:, i, :] = logits_processor(candidate_input_ids[:, : cur_len + i], new_logits[:, i, :])
+                if tree_draft is not None:
+                    node_contexts = _tree_spec_node_contexts(input_ids, tree_draft)
+                    for i, node_context in enumerate(node_contexts):
+                        new_logits[:, i, :] = logits_processor(node_context, new_logits[:, i, :])
+                else:
+                    for i in range(candidate_length + 1):
+                        new_logits[:, i, :] = logits_processor(
+                            candidate_input_ids[:, : cur_len + i], new_logits[:, i, :]
+                        )
 
             # 3. Select the accepted tokens. There are two possible cases:
             # Case 1: `do_sample=True` and we have logits for the candidates (originally from speculative decoding)
             # 👉 Apply algorithm 1 from the speculative decoding paper (https://huggingface.co/papers/2211.17192).
-            if do_sample and candidate_logits is not None:
+            tree_logits_indices = None
+            if tree_draft is not None:
+                valid_tokens, n_matches, tree_logits_indices, tree_accepted_nodes = _tree_spec_acceptance(
+                    new_logits, tree_draft, do_sample
+                )
+            elif do_sample and candidate_logits is not None:
                 valid_tokens, n_matches = _speculative_sampling(
                     candidate_input_ids,
                     candidate_logits,
@@ -3610,9 +3649,13 @@ class GenerationMixin(ContinuousMixin):
             if streamer is not None:
                 streamer.put(valid_tokens.cpu())
             new_cur_len = input_ids.shape[1]
+            num_added_tokens = valid_tokens.shape[-1]
 
             # 4.2. Discard past key values relative to unused assistant tokens
-            outputs.past_key_values.crop(new_cur_len - 1)
+            if tree_draft is not None:
+                _compact_tree_spec_cache(outputs.past_key_values, cur_len, tree_accepted_nodes)
+            else:
+                outputs.past_key_values.crop(new_cur_len - 1)
 
             # 5. Update the candidate generation strategy if needed
             candidate_generator.update_candidate_strategy(input_ids, new_logits, n_matches)
@@ -3622,7 +3665,7 @@ class GenerationMixin(ContinuousMixin):
                 outputs,
                 model_kwargs,
                 is_encoder_decoder=self.config.is_encoder_decoder,
-                num_new_tokens=n_matches + 1,
+                num_new_tokens=num_added_tokens,
             )
             if synced_gpus and this_peer_finished:
                 continue
@@ -3630,11 +3673,17 @@ class GenerationMixin(ContinuousMixin):
             # Store scores, attentions and hidden_states when required
             # Assistant: modified to append one tuple element per token, as in the other generation methods.
             if return_dict_in_generate:
-                newly_added_length = n_matches + 1
+                newly_added_length = num_added_tokens
                 if output_scores:
-                    scores += tuple(new_logits[:, i, :] for i in range(newly_added_length))
+                    if tree_logits_indices is None:
+                        scores += tuple(new_logits[:, i, :] for i in range(newly_added_length))
+                    else:
+                        scores += tuple(new_logits[:, i, :] for i in tree_logits_indices)
                 if output_logits:
-                    raw_logits += tuple(next_token_logits[:, i, :] for i in range(newly_added_length))
+                    if tree_logits_indices is None:
+                        raw_logits += tuple(next_token_logits[:, i, :] for i in range(newly_added_length))
+                    else:
+                        raw_logits += tuple(next_token_logits[:, i, :] for i in tree_logits_indices)
 
                 newly_added_length = new_cur_len if is_first_iteration else newly_added_length
                 if output_attentions:
@@ -3854,6 +3903,145 @@ def _speculative_sampling(
             valid_tokens = t
 
     return valid_tokens, n_matches
+
+
+def _prepare_tree_spec_inputs(
+    model_kwargs: dict[str, Any],
+    input_ids: torch.LongTensor,
+    tree_draft: Any,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Build the target-model inputs that verify a flattened draft tree on top of the existing KV cache.
+
+    The query block is made of the accepted tokens that are not in the cache yet (the whole prompt on the first
+    iteration, then only the last accepted token) followed by the draft nodes, in their topological order. Every query
+    attends to the cached prefix and to the uncached prefix (causally); each draft node additionally attends to its
+    ancestors and itself, but never to other branches. The position of a draft node is the position of the last
+    accepted token plus its depth in the tree.
+    """
+    cache = model_kwargs.get("past_key_values")
+    if cache is None:
+        raise ValueError("tree-based suffix speculative decoding requires `use_cache=True`.")
+    if input_ids.shape[0] != 1:
+        raise ValueError("tree-based suffix speculative decoding currently supports batch_size = 1.")
+
+    device = input_ids.device
+    cur_len = input_ids.shape[1]
+    cache_len = cache.get_seq_length()
+    num_prefix = cur_len - cache_len
+    num_draft = len(tree_draft.token_ids)
+    query_len = num_prefix + num_draft
+    kv_len = cache_len + query_len
+
+    # ancestor-or-self relation between draft nodes (nodes are topologically sorted), gathered as index pairs on the
+    # host so the mask is built with a handful of device ops whatever the tree size
+    ancestors: list[list[int]] = []
+    rows, cols = [], []
+    for node_idx, parent in enumerate(tree_draft.parents):
+        node_ancestors = (ancestors[parent] if parent >= 0 else []) + [node_idx]
+        ancestors.append(node_ancestors)
+        rows.extend([node_idx] * len(node_ancestors))
+        cols.extend(node_ancestors)
+
+    allowed = torch.ones((query_len, kv_len), dtype=torch.bool, device=device)
+    allowed[:num_prefix, cache_len:] = torch.ones((num_prefix, query_len), dtype=torch.bool, device=device).tril()
+    draft_block = torch.zeros((num_draft, num_draft), dtype=torch.bool)
+    draft_block[rows, cols] = True
+    allowed[num_prefix:, cur_len:] = draft_block.to(device, non_blocking=True)
+
+    attention_mask_2d = model_kwargs.get("attention_mask")
+    if attention_mask_2d is not None:
+        attention_mask_2d = attention_mask_2d[0, :cur_len].to(device=device, dtype=torch.bool)
+        allowed[:, :cur_len] &= attention_mask_2d
+        positions = (attention_mask_2d.long().cumsum(-1) - 1).clamp(min=0)
+    else:
+        positions = torch.arange(cur_len, device=device)
+
+    mask_dtype = dtype if dtype.is_floating_point else torch.float32
+    attention_mask = torch.zeros((1, 1, query_len, kv_len), dtype=mask_dtype, device=device)
+    attention_mask.masked_fill_(~allowed, torch.finfo(mask_dtype).min)
+
+    depths = torch.tensor(tree_draft.depths, dtype=torch.long, device=device)
+    position_ids = torch.cat([positions[cache_len:], positions[-1] + depths]).unsqueeze(0)
+
+    draft_ids = torch.tensor(tree_draft.token_ids, dtype=input_ids.dtype, device=device)
+    query_ids = torch.cat([input_ids[0, cache_len:], draft_ids]).unsqueeze(0)
+
+    return {
+        "input_ids": query_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "cache_position": torch.arange(cache_len, kv_len, device=device),
+        "past_key_values": cache,
+        "use_cache": True,
+        "logits_to_keep": num_draft + 1,
+    }
+
+
+def _tree_spec_node_contexts(input_ids: torch.LongTensor, tree_draft: Any) -> list[torch.LongTensor]:
+    """Returns, for the root and every draft node, the token sequence that leads to it (used by logits processors)."""
+    contexts = [input_ids]
+    for node_idx, parent in enumerate(tree_draft.parents):
+        parent_context = contexts[parent + 1]
+        token = input_ids.new_tensor([[tree_draft.token_ids[node_idx]]])
+        contexts.append(torch.cat([parent_context, token], dim=-1))
+    return contexts
+
+
+def _tree_spec_acceptance(
+    new_logits: torch.FloatTensor,
+    tree_draft: Any,
+    do_sample: bool,
+) -> tuple[torch.LongTensor, int, list[int], list[int]]:
+    """Accept the longest path through a verified draft tree.
+
+    Row 0 of `new_logits` holds the target distribution after the last accepted token, row `i + 1` the one after draft
+    node `i`. We pick (or sample) one token per row and walk down from the root, following the child whose token
+    matches. Since the draft is deterministic, this preserves the target distribution in both greedy and sampling mode.
+
+    Returns the accepted tokens (including the bonus token), the number of accepted draft nodes, the logits rows used
+    for each returned token, and the accepted draft node indices.
+    """
+    if do_sample:
+        probs = new_logits[0].softmax(dim=-1)
+        selected_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+    else:
+        selected_tokens = new_logits[0].argmax(dim=-1)
+    selected = selected_tokens.tolist()
+
+    children: dict[tuple[int, int], int] = {}
+    for node_idx, parent in enumerate(tree_draft.parents):
+        children.setdefault((parent, tree_draft.token_ids[node_idx]), node_idx)
+
+    accepted_nodes = []
+    logits_indices = [0]
+    node = children.get((-1, selected[0]))
+    while node is not None:
+        accepted_nodes.append(node)
+        logits_indices.append(node + 1)
+        node = children.get((node, selected[node + 1]))
+
+    valid_tokens = selected_tokens[logits_indices].unsqueeze(0)
+    return valid_tokens, len(accepted_nodes), logits_indices, accepted_nodes
+
+
+def _compact_tree_spec_cache(cache: Cache, prefix_len: int, accepted_nodes: list[int]) -> None:
+    """Keeps the KV entries of the accepted prefix and of the accepted draft path, dropping every other branch.
+
+    After verification the cache holds `prefix_len` accepted entries followed by one entry per draft node in flattened
+    order. The accepted path is moved right after the prefix, then the cache is cropped.
+    """
+    num_accepted = len(accepted_nodes)
+    if accepted_nodes != list(range(num_accepted)):
+        for layer in cache.layers:
+            if type(layer) is not DynamicLayer:
+                raise ValueError(
+                    f"tree-based suffix speculative decoding only supports full-attention dynamic caches, got {type(layer)}."
+                )
+            keep = torch.tensor(accepted_nodes, device=layer.keys.device) + prefix_len
+            layer.keys[..., prefix_len : prefix_len + num_accepted, :] = layer.keys[..., keep, :]
+            layer.values[..., prefix_len : prefix_len + num_accepted, :] = layer.values[..., keep, :]
+    cache.crop(prefix_len + num_accepted)
 
 
 def _split_model_outputs(outputs, new_outputs, cur_len, added_len, is_decoder_attention=False):

@@ -14,13 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Suffix Decoding for Transformers
+# Suffix and Tree Speculative Decoding for Transformers
 
-This fork's `suffix-decoding` branch integrates suffix-tree-based speculative candidate generation into the Hugging Face Transformers generation pipeline. The implementation adds an online compressed suffix tree over prompt and accepted tokens, generation configuration and candidate-generator integration, and a bounded cross-request cache for reusing suffix matches across generation calls.
+This fork adds two draft-model-free speculative decoding methods to the Hugging Face Transformers `generate` loop:
 
-My implementation work covers the core suffix tree, the `SuffixDecodingCandidateGenerator`, generation-pipeline integration, cross-request caching, and cache-eviction fixes. See the [project commits](https://github.com/stormckey/transformers/commits/suffix-decoding/?author=stormckey) for the attributed history.
+- **Suffix decoding.** An online compressed suffix tree over the prompt and accepted tokens proposes a draft
+  continuation by matching the recent token tail; optional per-request and cross-request trees with FIFO eviction.
+- **Tree speculative decoding.** Drafts a whole tree of candidate continuations from the same suffix tree and verifies
+  it in one forward pass using a 4D tree attention mask and depth-based position ids, then keeps the longest accepted
+  branch.
 
-The companion [`sd-bench`](https://github.com/stormckey/sd-bench) repository provides the Modal benchmark harness, pinned implementation revisions, L40S results, and no-GPU configuration and adapter tests.
+Both keep greedy outputs unchanged: drafts are always verified by the target model.
+
+## Results
+
+Qwen3-8B on one H100, bf16, batch size 1, greedy, up to 384 new tokens, 30 prompts per task, all methods run back to
+back per prompt in rotated order. Geometric-mean speedup over autoregressive decoding, recomputed from the raw records
+in [`bench_tree_spec/results/qwen3-8b-h100-v3.json`](bench_tree_spec/results/qwen3-8b-h100-v3.json):
+
+| Task | Prompt lookup | Suffix | Tree |
+|---|---:|---:|---:|
+| Code editing (CanItEdit) | 3.90× | 6.64× | **9.04×** |
+| HumanEval | 1.69× | 1.85× | **1.93×** |
+| GSM8K | 1.41× | 1.43× | **1.57×** |
+| Chat (MT-Bench) | 1.11× | **1.15×** | 1.13× |
+| **All** | 1.79× | 2.12× | **2.36×** |
+
+Tree vs. suffix, paired per prompt: 1.11× (95% bootstrap CI 1.08–1.15). Method, ablations and profiling:
+[`bench_tree_spec/RESULTS.md`](bench_tree_spec/RESULTS.md). The original course evaluation (L40S, six workloads, up to
+1.74× for suffix decoding) is in [`stormckey/sd-bench`](https://github.com/stormckey/sd-bench).
 
 ## Usage
 
@@ -30,37 +52,36 @@ from transformers.generation import SuffixDecodingCache
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", torch_dtype="auto", device_map="auto")
-
-# Optional: share suffix trees across requests (oldest request evicted first).
-cache = SuffixDecodingCache(max_depth=64, max_cached_requests=100)
-
 inputs = tok("Translate to English: Bonjour tout le monde.", return_tensors="pt").to(model.device)
-out = model.generate(
-    **inputs,
-    max_new_tokens=256,
-    do_sample=False,
-    suffix_decoding_num_tokens=10,   # draft length; setting it enables suffix decoding
-    suffix_decoding_cache=cache,     # omit for a per-request tree only
-)
+
+# Suffix decoding (linear drafts); the cache is optional and shares trees across requests.
+out = model.generate(**inputs, max_new_tokens=256, do_sample=False,
+                     suffix_decoding_num_tokens=10,
+                     suffix_decoding_cache=SuffixDecodingCache(max_depth=64, max_cached_requests=100))
+
+# Tree speculative decoding with the settings used for the results above.
+out = model.generate(**inputs, max_new_tokens=256, do_sample=False,
+                     tree_spec_decoding_num_tokens=128, tree_spec_decoding_branch_factor=8,
+                     tree_spec_decoding_min_prob=0.02,
+                     tree_spec_decoding_max_spec_factor=1e9, tree_spec_decoding_max_spec_offset=1e9)
 ```
 
-With greedy decoding the output is identical to plain `generate`; drafts are verified by the target model, so suffix
-decoding only changes how many tokens each forward pass can accept. Tuning knobs: `suffix_decoding_max_depth`
-(default 64) and `suffix_decoding_min_prob` (default 0.1).
+Both snippets were smoke-tested on a tiny GPT-2: outputs match plain greedy `generate`.
 
-## Results
+## What changed after the course
 
-On Qwen3-8B with one NVIDIA L40S (batch size 1, greedy, 10 prompts per workload), suffix decoding reached up to
-**1.74×** the throughput of autoregressive decoding (WildChat code) and was the fastest of five methods on 4 of 6
-workloads. Full table, figure, and harness: [`stormckey/sd-bench`](https://github.com/stormckey/sd-bench#results).
+The tree verifier first written by the team cropped the KV cache to the first *n* flattened draft nodes, which is only
+correct when the accepted branch is the first one in flattened order; otherwise rejected tokens' KV stayed in the cache
+and corrupted later steps. It now moves the accepted path's KV next to the prefix before cropping, and in float32 every
+method reproduces greedy decoding exactly (`tests/generation/test_candidate_generator.py`). Lifting the old draft-size
+cap was the main speed win: a Qwen3-8B forward on H100 costs about the same for 1 or 129 query tokens.
 
-### Follow-up: tree verification fix (September 2026)
+## Attribution
 
-Branch [`tree-spec-fix`](https://github.com/stormckey/transformers/tree/tree-spec-fix) fixes a KV-cache bug in the
-team's tree-based verifier (accepting a non-first branch kept rejected tokens' KV) and lifts the draft-size cap. On
-Qwen3-8B / H100 with 30 prompts per task, suffix decoding averaged **2.12×** and the fixed tree variant **2.36×** over
-autoregressive decoding, up to 9.0× on code editing. Details and raw records:
-[`bench_tree_spec/RESULTS.md`](https://github.com/stormckey/transformers/blob/tree-spec-fix/bench_tree_spec/RESULTS.md).
+CMU 15-642 (Spring 2026) team project by Chenhao Gao, Yuchen Zhou and Zihao Du. Chenhao wrote the suffix tree,
+`SuffixDecodingCandidateGenerator`, generation integration and cross-request cache (April 2026), and the tree-verifier
+fix, tests and H100 benchmarks (September 2026). The initial tree-spec branch and source-mode selector are team work;
+Git history keeps each author's commits.
 
 ---
 

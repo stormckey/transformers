@@ -42,6 +42,7 @@ else:
         "EarlyExitCandidateGenerator",
         "PromptLookupCandidateGenerator",
         "SuffixDecodingCandidateGenerator",
+        "TreeSpecDecodingCandidateGenerator",
     ]
     _import_structure["suffix_tree"] = [
         "SuffixDecodingCache",
@@ -137,6 +138,7 @@ if TYPE_CHECKING:
             EarlyExitCandidateGenerator,
             PromptLookupCandidateGenerator,
             SuffixDecodingCandidateGenerator,
+            TreeSpecDecodingCandidateGenerator,
         )
         from .continuous_batching import (
             ContinuousBatchingManager,
