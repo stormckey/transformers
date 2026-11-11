@@ -6,6 +6,10 @@ the longest root-to-node path that matches the true continuation, and one target
 tokens per forward (and draft sizes / draft CPU time) for any policy at zero GPU cost.
 
     python bench_tree_spec/simulate.py bench_tree_spec/results/dev_vanilla.json
+    python bench_tree_spec/simulate.py bench_tree_spec/results/dev_vanilla.json --cache
+
+`--cache` replays the requests of each task in order through one `SuffixDecodingCache`, so later requests can draft
+from earlier responses, and compares it with per-request (local-only) drafting.
 """
 
 import json
@@ -13,7 +17,7 @@ import sys
 import time
 from collections import defaultdict
 
-from transformers.generation.suffix_tree import SuffixTree
+from transformers.generation.suffix_tree import SuffixDecodingCache, SuffixTree
 
 
 def replay(rows, policy, max_depth=64):
@@ -131,6 +135,69 @@ POLICIES = {
 }
 
 
+def accepted_length(token_ids, parents, out, pos):
+    children = {}
+    for i, (tok, par) in enumerate(zip(token_ids, parents)):
+        children.setdefault((par, tok), i)
+    node, k = -1, 0
+    while pos + k < len(out) and (node := children.get((node, out[pos + k]))) is not None:
+        k += 1
+    return k
+
+
+LINEAR_KWARGS = {"max_spec_tokens": 32, "min_token_prob": 0.1}
+TREE_KWARGS = {
+    "max_spec_tokens": 128,
+    "min_token_prob": 0.02,
+    "branch_factor": 8,
+    "max_spec_factor": 1e9,
+    "max_spec_offset": 1e9,
+}
+
+
+def replay_cache(rows, tree_drafts, source_mode, max_cached_requests=64, max_depth=64):
+    """Tokens per forward and draft nodes per forward for a stream of requests sharing one cache."""
+    cache = SuffixDecodingCache(max_depth, max_cached_requests, source_mode)
+    tokens = forwards = nodes = 0
+    for row in rows:
+        prompt, out = row["prompt"], row["output"]
+        req_id = cache.start_request(prompt)
+        seq = list(prompt)
+        pos = 0
+        while pos < len(out):
+            if tree_drafts:
+                draft = cache.speculate_tree(req_id, seq[-max_depth:], **TREE_KWARGS)
+            else:
+                draft = cache.speculate(req_id, seq[-max_depth:], **LINEAR_KWARGS)
+            k = accepted_length(draft.token_ids, draft.parents, out, pos)
+            new = out[pos : pos + k + 1]
+            cache.add_active_response(req_id, new)
+            seq.extend(new)
+            pos += len(new)
+            forwards += 1
+            nodes += len(draft.token_ids)
+        cache.stop_request(req_id)
+        tokens += len(out)
+    return tokens / forwards, nodes / forwards
+
+
+def main_cache(path):
+    data = json.load(open(path))
+    columns = [
+        ("suffix local", False, "local_only"),
+        ("suffix +shared", False, "local_and_global"),
+        ("tree local", True, "local_only"),
+        ("tree +shared", True, "local_and_global"),
+    ]
+    print(f"{'task':<12}" + "".join(f"{name:>20}" for name, _, _ in columns) + "   (tokens/forward, draft nodes)")
+    for d in data:
+        cells = []
+        for _, tree_drafts, mode in columns:
+            tpf, q = replay_cache(d["rows"], tree_drafts, mode)
+            cells.append(f"{tpf:6.2f} q{q:5.1f}")
+        print(f"{d['task']:<12}" + "".join(f"{c:>20}" for c in cells), flush=True)
+
+
 def main(path, names=None):
     data = json.load(open(path))
     names = names or list(POLICIES)
@@ -146,4 +213,7 @@ def main(path, names=None):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2:] or None)
+    if "--cache" in sys.argv:
+        main_cache(sys.argv[1])
+    else:
+        main(sys.argv[1], sys.argv[2:] or None)

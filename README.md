@@ -19,7 +19,8 @@ limitations under the License.
 This fork adds two draft-model-free speculative decoding methods to the Hugging Face Transformers `generate` loop:
 
 - **Suffix decoding.** An online compressed suffix tree over the prompt and accepted tokens proposes a draft
-  continuation by matching the recent token tail; optional per-request and cross-request trees with FIFO eviction.
+  continuation by matching the recent token tail. An optional cross-request cache also drafts from earlier responses,
+  kept in a shared suffix tree with generation-based eviction.
 - **Tree speculative decoding.** Drafts a whole tree of candidate continuations from the same suffix tree and verifies
   it in one forward pass using a 4D tree attention mask and depth-based position ids, then keeps the longest accepted
   branch.
@@ -29,8 +30,8 @@ Both keep greedy outputs unchanged: drafts are always verified by the target mod
 ## Results
 
 Qwen3-8B on one H100, bf16, batch size 1, greedy, up to 384 new tokens, 30 prompts per task, all methods run back to
-back per prompt in rotated order. Geometric-mean speedup over autoregressive decoding, recomputed from the raw records
-in [`bench_tree_spec/results/qwen3-8b-h100-v3.json`](bench_tree_spec/results/qwen3-8b-h100-v3.json):
+back per prompt in rotated order. Geometric-mean speedup over Hugging Face's default (eager) greedy decoding,
+recomputed from the raw records in [`bench_tree_spec/results/qwen3-8b-h100-v3.json`](bench_tree_spec/results/qwen3-8b-h100-v3.json):
 
 | Task | Prompt lookup | Suffix | Tree |
 |---|---:|---:|---:|
@@ -40,8 +41,14 @@ in [`bench_tree_spec/results/qwen3-8b-h100-v3.json`](bench_tree_spec/results/qwe
 | Chat (MT-Bench) | 1.11× | **1.15×** | 1.13× |
 | **All** | 1.79× | 2.12× | **2.36×** |
 
-Tree vs. suffix, paired per prompt: 1.11× (95% bootstrap CI 1.08–1.15). Method, ablations and profiling:
-[`bench_tree_spec/RESULTS.md`](bench_tree_spec/RESULTS.md). The original course evaluation (L40S, six workloads, up to
+Tree vs. suffix, paired per prompt: 1.11× (95% bootstrap CI 1.08–1.15). With the cross-request cache, tree decoding
+reaches 2.72× over all prompts (1.14× over tree decoding without it, CI 1.10–1.18; 2.47× on HumanEval, 2.07× on GSM8K).
+
+Read these numbers with two caveats, both measured in [`bench_tree_spec/RESULTS.md`](bench_tree_spec/RESULTS.md)
+together with the method, ablations and profiling. Code editing dominates the average: without it the tree speedup
+is 1.51×, and its total-time ratio is 6.5× rather than 9×. And the baseline is eager: a static KV cache with
+`torch.compile` makes plain greedy decoding 2.2–3.0× faster by itself. Verifying 129 draft tokens still costs only
+1.14× one token under CUDA graphs, so the two stack, but the speculative paths here are not compiled yet. The original course evaluation (L40S, six workloads, up to
 1.74× for suffix decoding) is in [`stormckey/sd-bench`](https://github.com/stormckey/sd-bench).
 
 ## Usage
@@ -76,11 +83,17 @@ and corrupted later steps. It now moves the accepted path's KV next to the prefi
 method reproduces greedy decoding exactly (`tests/generation/test_candidate_generator.py`). Lifting the old draft-size
 cap was the main speed win: a Qwen3-8B forward on H100 costs about the same for 1 or 129 query tokens.
 
+The first cross-request cache kept one suffix tree per cached response and let cached drafts compete with local ones
+on score; measured, it was slower than no cache. It now inserts every response into a shared tree, so counts add up
+across responses, and combines the sources instead of ranking them: tree drafts are the union of the local and
+shared drafts, verified in one forward (November 2026).
+
 ## Attribution
 
 CMU 15-642 (Spring 2026) team project by Chenhao Gao, Yuchen Zhou and Zihao Du. Chenhao wrote the suffix tree,
-`SuffixDecodingCandidateGenerator`, generation integration and cross-request cache (April 2026), and the tree-verifier
-fix, tests and H100 benchmarks (September 2026). The initial tree-spec branch and source-mode selector are team work;
+`SuffixDecodingCandidateGenerator`, generation integration and cross-request cache (April 2026), the tree-verifier
+fix, tests and H100 benchmarks (September 2026), and the shared-tree cache and compiled-baseline measurements
+(November 2026). The initial tree-spec branch and source-mode selector are team work;
 Git history keeps each author's commits.
 
 ---

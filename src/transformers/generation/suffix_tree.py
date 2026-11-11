@@ -435,15 +435,21 @@ class SuffixTree:
 class SuffixDecodingCache:
     """Persistent cache for suffix decoding across multiple generation calls.
 
-    Maintains a pool of per-request suffix trees from completed requests,
-    allowing future requests to draft from previously seen token sequences.
-    Each active request also gets a local suffix tree seeded with its prompt
-    tokens. Speculation queries the local tree and all cached global trees,
-    returning the highest-scoring draft.
+    Every active request has a local suffix tree seeded with its prompt. Responses are also inserted, while they are
+    generated, into a suffix tree shared by all requests, so the continuation counts of a matched context add up
+    over earlier responses: a context followed by the same tokens in many responses gives a confident draft, a
+    context seen once does not.
 
-    When the cache reaches capacity, the oldest request's tree is evicted
-    entirely, ensuring clean memory reclamation without requiring node-level
-    deletion from a shared tree.
+    The two sources are combined rather than ranked against each other by score:
+
+    - `speculate` (linear drafts) returns the local draft and falls back to the shared tree only when the local
+      tree has no continuation for the current context.
+    - `speculate_tree` (tree drafts) returns the union of the local and shared draft trees, cut to the
+      `max_spec_tokens` most likely nodes. Tree verification checks both sources in one forward pass.
+
+    To bound memory without deleting single nodes, the shared tree is kept as two generations. A new generation
+    starts when the newest one holds `ceil(max_cached_requests / 2)` responses, and the oldest generation is then
+    dropped as a whole.
 
     Usage::
 
@@ -458,16 +464,18 @@ class SuffixDecodingCache:
             )
 
     Args:
-        max_depth: Maximum suffix tree depth for both local and global trees.
+        max_depth: Maximum suffix tree depth for both local and shared trees.
         max_cached_requests: Maximum number of completed responses to keep in
-            the global cache. When exceeded, oldest responses are evicted.
-            Set to 0 to disable the global cache entirely (local-only mode).
+            the shared trees. Between half of this number and this number of
+            the most recent responses are available at any time.
+            Set to 0 to disable the shared trees entirely (local-only mode).
             Set to -1 for unlimited caching.
         source_mode: Which candidate source(s) to use when speculating.
-            ``"local_and_global"`` compares the active request's local tree
-            against all cached global trees and keeps the highest-scoring
-            draft. ``"local_only"`` uses only the active request's tree.
-            ``"global_only"`` uses only cached trees from prior requests.
+            ``"local_and_global"`` combines the active request's local tree
+            with the shared trees as described above. ``"local_only"`` uses
+            only the active request's tree. ``"global_only"`` uses only the
+            shared trees, which hold responses (not prompts), including the
+            part of the active response generated so far.
     """
 
     def __init__(
@@ -481,10 +489,14 @@ class SuffixDecodingCache:
         self._max_depth = max_depth
         self._max_cached_requests = max_cached_requests
         self._source_mode = source_mode
-        self._global_trees: dict[int, SuffixTree] = {}
         self._local_trees: dict[int, SuffixTree] = {}
+        # shared trees, oldest generation first; at most two
+        self._shared_trees: list[SuffixTree] = []
+        # active request -> the generation that receives its response
+        self._shared_tree_of: dict[int, SuffixTree] = {}
+        self._newest_generation_size = 0
+        self._generation_size = -1 if max_cached_requests < 0 else (max_cached_requests + 1) // 2
         self._next_seq_id = 1
-        self._cached_order: list[int] = []
 
     def start_request(self, prompt_token_ids: list[int]) -> int:
         """Start a new request, creating a local tree seeded with prompt tokens.
@@ -502,16 +514,19 @@ class SuffixDecodingCache:
         local_tree.extend(0, prompt_token_ids)
         self._local_trees[req_id] = local_tree
 
-        # Allocate a global tree slot if caching is enabled
         if self._max_cached_requests != 0:
-            self._evict_if_needed()
-            self._global_trees[req_id] = SuffixTree(max_depth=self._max_depth)
-            self._cached_order.append(req_id)
+            newest_is_full = self._generation_size > 0 and self._newest_generation_size >= self._generation_size
+            if not self._shared_trees or newest_is_full:
+                # start a new generation and drop the oldest one as a whole
+                self._shared_trees = self._shared_trees[-1:] + [SuffixTree(max_depth=self._max_depth)]
+                self._newest_generation_size = 0
+            self._shared_tree_of[req_id] = self._shared_trees[-1]
+            self._newest_generation_size += 1
 
         return req_id
 
     def add_active_response(self, req_id: int, token_ids: list[int]) -> None:
-        """Append accepted output tokens to the local and global trees.
+        """Append accepted output tokens to the local and shared trees.
 
         Only call this with verified (accepted) tokens, never speculative ones.
 
@@ -522,8 +537,14 @@ class SuffixDecodingCache:
         if req_id in self._local_trees:
             self._local_trees[req_id].extend(0, token_ids)
 
-        if req_id in self._global_trees:
-            self._global_trees[req_id].extend(0, token_ids)
+        if req_id in self._shared_tree_of:
+            self._shared_tree_of[req_id].extend(req_id, token_ids)
+
+    def _use_local(self, req_id: int) -> bool:
+        return self._source_mode in {"local_and_global", "local_only"} and req_id in self._local_trees
+
+    def _use_shared(self) -> bool:
+        return self._source_mode in {"local_and_global", "global_only"}
 
     def speculate(
         self,
@@ -534,7 +555,7 @@ class SuffixDecodingCache:
         max_spec_factor: float = 3.0,
         max_spec_offset: float = 5.0,
     ) -> SuffixDecodingDraft:
-        """Run speculation against local and all cached global trees, return the best.
+        """Return the local draft, or the best shared-tree draft when the local tree has none.
 
         Args:
             req_id: The request ID returned by :meth:`start_request`.
@@ -545,7 +566,7 @@ class SuffixDecodingCache:
             max_spec_offset: Soft cap offset.
 
         Returns:
-            The highest-scoring draft from any tree.
+            A linear-chain draft. May have empty `token_ids`.
         """
         spec_kwargs = {
             "context": context,
@@ -556,20 +577,15 @@ class SuffixDecodingCache:
         }
 
         best = SuffixDecodingDraft()
+        if self._use_local(req_id):
+            best = self._local_trees[req_id].speculate(**spec_kwargs)
+        if best.token_ids or not self._use_shared():
+            return best
 
-        if self._source_mode in {"local_and_global", "local_only"} and req_id in self._local_trees:
-            local_draft = self._local_trees[req_id].speculate(**spec_kwargs)
-            if local_draft.score >= best.score:
-                best = local_draft
-
-        if self._source_mode in {"local_and_global", "global_only"}:
-            for cached_id, tree in self._global_trees.items():
-                if cached_id == req_id:
-                    continue  # skip own global tree, local tree covers it
-                draft = tree.speculate(**spec_kwargs)
-                if draft.score >= best.score:
-                    best = draft
-
+        for tree in self._shared_trees:
+            draft = tree.speculate(**spec_kwargs)
+            if draft.score >= best.score:
+                best = draft
         return best
 
     def speculate_tree(
@@ -582,7 +598,7 @@ class SuffixDecodingCache:
         max_spec_factor: float = 3.0,
         max_spec_offset: float = 5.0,
     ) -> SuffixDecodingDraft:
-        """Run branching speculation against local/global suffix trees."""
+        """Return the union of the local and shared draft trees, cut to `max_spec_tokens` nodes."""
         spec_kwargs = {
             "context": context,
             "max_spec_tokens": max_spec_tokens,
@@ -592,37 +608,57 @@ class SuffixDecodingCache:
             "max_spec_offset": max_spec_offset,
         }
 
-        best = SuffixDecodingDraft()
+        drafts = []
+        if self._use_local(req_id):
+            drafts.append(self._local_trees[req_id].speculate_tree(**spec_kwargs))
+        if self._use_shared():
+            drafts.extend(tree.speculate_tree(**spec_kwargs) for tree in self._shared_trees)
+        drafts = [draft for draft in drafts if draft.token_ids]
 
-        if self._source_mode in {"local_and_global", "local_only"} and req_id in self._local_trees:
-            local_draft = self._local_trees[req_id].speculate_tree(**spec_kwargs)
-            if local_draft.score >= best.score:
-                best = local_draft
-
-        if self._source_mode in {"local_and_global", "global_only"}:
-            for cached_id, tree in self._global_trees.items():
-                if cached_id == req_id:
-                    continue
-                draft = tree.speculate_tree(**spec_kwargs)
-                if draft.score >= best.score:
-                    best = draft
-
-        return best
+        if not drafts:
+            return SuffixDecodingDraft()
+        if len(drafts) == 1:
+            return drafts[0]
+        return merge_drafts(drafts, max_spec_tokens)
 
     def stop_request(self, req_id: int) -> None:
-        """End a request, removing its local tree but keeping global cache.
+        """End a request, removing its local tree but keeping its response in the shared tree.
 
         Args:
             req_id: The request ID returned by :meth:`start_request`.
         """
         self._local_trees.pop(req_id, None)
+        self._shared_tree_of.pop(req_id, None)
 
-    def _evict_if_needed(self) -> None:
-        """Evict the oldest cached response tree if at capacity."""
-        if self._max_cached_requests < 0:
-            return
-        while len(self._cached_order) >= self._max_cached_requests:
-            if not self._cached_order:
-                break
-            evicted_id = self._cached_order.pop(0)
-            self._global_trees.pop(evicted_id, None)
+
+def merge_drafts(drafts: list[SuffixDecodingDraft], max_nodes: int) -> SuffixDecodingDraft:
+    """Merge draft trees into one and keep its `max_nodes` most likely nodes.
+
+    Nodes reached by the same token path are merged and keep the highest probability any draft gave them. A node
+    is never more likely than its parent, so ordering by probability (then depth) puts every parent before its
+    children and cutting the order anywhere leaves a valid tree.
+    """
+    # (merged parent id, token) -> [merged id, probability, depth]
+    merged: dict[tuple[int, int], list] = {}
+    for draft in drafts:
+        merged_ids = []
+        for token, parent, prob, depth in zip(draft.token_ids, draft.parents, draft.probs, draft.depths):
+            key = (merged_ids[parent] if parent >= 0 else -1, token)
+            entry = merged.get(key)
+            if entry is None:
+                entry = merged[key] = [len(merged), prob, depth]
+            elif prob > entry[1]:
+                entry[1] = prob
+            merged_ids.append(entry[0])
+
+    result = SuffixDecodingDraft(match_len=max(draft.match_len for draft in drafts))
+    new_index: dict[int, int] = {}
+    kept = sorted(merged.items(), key=lambda item: (-item[1][1], item[1][2]))[:max_nodes]
+    for (parent, token), (merged_id, prob, depth) in kept:
+        new_index[merged_id] = len(result.token_ids)
+        result.token_ids.append(token)
+        result.parents.append(new_index[parent] if parent != -1 else -1)
+        result.probs.append(prob)
+        result.depths.append(depth)
+        result.score += prob
+    return result
