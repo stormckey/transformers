@@ -13,7 +13,7 @@ from transformers.generation.candidate_generator import (
     UniversalSpeculativeDecodingGenerator,
     _prune_draft_nodes,
 )
-from transformers.generation.suffix_tree import SuffixDecodingDraft, SuffixTree
+from transformers.generation.suffix_tree import SuffixDecodingCache, SuffixDecodingDraft, SuffixTree, merge_drafts
 from transformers.generation.utils import (
     _compact_tree_spec_cache,
     _prepare_tree_spec_inputs,
@@ -129,6 +129,124 @@ class TestTreeSpecDecoding(unittest.TestCase):
         for layer, ref_layer in zip(cache.layers, reference.layers):
             torch.testing.assert_close(layer.keys, ref_layer.keys, rtol=1e-4, atol=1e-4)
             torch.testing.assert_close(layer.values, ref_layer.values, rtol=1e-4, atol=1e-4)
+
+
+@require_torch
+class TestSuffixDecodingCache(unittest.TestCase):
+    def _finished_request(self, cache, prompt, response):
+        req_id = cache.start_request(prompt)
+        cache.add_active_response(req_id, response)
+        cache.stop_request(req_id)
+
+    def test_shared_tree_adds_up_counts_across_responses(self):
+        cache = SuffixDecodingCache(max_depth=8)
+        self._finished_request(cache, [20], [1, 2, 3, 30])
+        self._finished_request(cache, [21], [1, 2, 3, 31])
+        self._finished_request(cache, [22], [1, 2, 4, 32])
+
+        req_id = cache.start_request([40, 1, 2])
+        draft = cache.speculate_tree(req_id, [40, 1, 2], max_spec_tokens=8, min_token_prob=0.0, branch_factor=4)
+
+        # after [1, 2], two of three responses continue with 3 and one with 4
+        self.assertEqual(draft.token_ids[:2], [3, 4])
+        self.assertAlmostEqual(draft.probs[0], 2 / 3)
+        self.assertAlmostEqual(draft.probs[1], 1 / 3)
+
+    def test_linear_draft_uses_shared_tree_only_without_local_match(self):
+        cache = SuffixDecodingCache(max_depth=8)
+        self._finished_request(cache, [20], [1, 2, 3, 3, 3, 5, 6, 7])
+
+        # the prompt holds its own continuation of [1, 2]: the local draft wins although the shared one is as long
+        req_id = cache.start_request([1, 2, 9, 9, 9, 1, 2])
+        self.assertEqual(cache.speculate(req_id, [9, 1, 2], max_spec_tokens=3).token_ids[:1], [9])
+        cache.stop_request(req_id)
+
+        # no local continuation for [5, 6]: fall back to the earlier response
+        req_id = cache.start_request([40, 5, 6])
+        self.assertEqual(cache.speculate(req_id, [40, 5, 6], max_spec_tokens=3).token_ids, [7])
+
+    def test_tree_draft_merges_local_and_shared_sources(self):
+        cache = SuffixDecodingCache(max_depth=8)
+        self._finished_request(cache, [20], [1, 2, 3, 5])
+
+        req_id = cache.start_request([1, 2, 9, 6, 1, 2])
+        draft = cache.speculate_tree(req_id, [6, 1, 2], max_spec_tokens=8, min_token_prob=0.0, branch_factor=4)
+
+        roots = {token for token, parent in zip(draft.token_ids, draft.parents) if parent == -1}
+        self.assertEqual(roots, {9, 3})
+        for node, parent in enumerate(draft.parents):
+            self.assertLess(parent, node)
+            self.assertEqual(draft.depths[node], 1 if parent == -1 else draft.depths[parent] + 1)
+
+    def test_merge_drafts_cut_keeps_a_valid_tree(self):
+        first = SuffixDecodingDraft(token_ids=[5, 6, 7], parents=[-1, 0, 1], probs=[1.0, 0.5, 0.5], depths=[1, 2, 3])
+        second = SuffixDecodingDraft(token_ids=[5, 8, 9], parents=[-1, 0, -1], probs=[0.9, 0.9, 0.2], depths=[1, 2, 1])
+
+        merged = merge_drafts([first, second], max_nodes=3)
+
+        # shared root 5 keeps the higher probability; the cut drops the least likely nodes, never a parent
+        self.assertEqual(merged.token_ids, [5, 8, 6])
+        self.assertEqual(merged.parents, [-1, 0, 0])
+        self.assertEqual(merged.probs, [1.0, 0.9, 0.5])
+
+    def test_old_generation_is_dropped_as_a_whole(self):
+        cache = SuffixDecodingCache(max_depth=8, max_cached_requests=4)  # generations of two responses
+        for i in range(5):
+            self._finished_request(cache, [20], [100 + i, 110 + i, 120 + i])
+
+        self.assertEqual(len(cache._shared_trees), 2)
+        req_id = cache.start_request([40])
+        drafted = [cache.speculate(req_id, [100 + i, 110 + i], max_spec_tokens=2).token_ids for i in range(5)]
+        # responses 0 and 1 left with the first generation; 2, 3 and 4 are still available
+        self.assertEqual(drafted, [[], [], [122], [123], [124]])
+
+    def test_local_only_and_disabled_cache_ignore_earlier_responses(self):
+        for cache in (
+            SuffixDecodingCache(max_depth=8, source_mode="local_only"),
+            SuffixDecodingCache(max_depth=8, max_cached_requests=0),
+        ):
+            self._finished_request(cache, [20], [5, 6, 7])
+            req_id = cache.start_request([40, 5, 6])
+            self.assertEqual(cache.speculate(req_id, [40, 5, 6], max_spec_tokens=3).token_ids, [])
+            self.assertEqual(cache.speculate_tree(req_id, [40, 5, 6], max_spec_tokens=3).token_ids, [])
+
+    def test_generation_with_shared_cache_matches_greedy(self):
+        config = AutoConfig.for_model(
+            "llama",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+        torch.manual_seed(0)
+        model = AutoModelForCausalLM.from_config(config, attn_implementation="sdpa").eval()
+        prompts = [
+            torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            torch.tensor([[7, 2, 3, 4, 9]]),
+            torch.tensor([[1, 2, 3, 4, 5, 6]]),
+        ]
+        kwargs = {"max_new_tokens": 40, "do_sample": False, "pad_token_id": 0, "eos_token_id": None}
+
+        suffix_cache, tree_cache = SuffixDecodingCache(max_depth=16), SuffixDecodingCache(max_depth=16)
+        for input_ids in prompts:
+            expected = model.generate(input_ids, **kwargs)
+            suffix = model.generate(
+                input_ids, suffix_decoding_num_tokens=8, suffix_decoding_cache=suffix_cache, **kwargs
+            )
+            tree = model.generate(
+                input_ids,
+                tree_spec_decoding_num_tokens=16,
+                tree_spec_decoding_branch_factor=4,
+                tree_spec_decoding_min_prob=0.0,
+                tree_spec_decoding_cache=tree_cache,
+                **kwargs,
+            )
+            self.assertEqual(suffix.tolist(), expected.tolist())
+            self.assertEqual(tree.tolist(), expected.tolist())
+        self.assertEqual(len(suffix_cache._shared_trees), 1)
+        self.assertEqual(len(suffix_cache._local_trees), 0)
 
 
 @require_torch
