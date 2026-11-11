@@ -80,6 +80,28 @@ Limits: the gain depends on responses repeating each other. It is large when req
 (HumanEval solutions, GSM8K step-by-step answers) and absent on mixed chat prompts. Batched or concurrent serving was
 not measured.
 
+## SWE-bench prompts (`results/qwen3-8b-h100-swebench.json`)
+
+A fifth task, added in November 2026 with the policy unchanged. Prompts are from SWE-bench Lite with oracle retrieval
+(`princeton-nlp/SWE-bench_Lite_oracle`): the issue, the source files the reference patch touches and a request for a
+patch. They carry whole files, so the prompt limit for this task is 8192 tokens instead of 2048 (110 of the 300 Lite
+prompts fit; the 30 used have 1877 to 8073 tokens, median 5064). This measures decoding latency only: the generated
+patches are not applied or scored.
+
+| | PLD | suffix | suffix + cache | tree_new | tree_new + cache |
+|---|---|---|---|---|---|
+| speedup (geometric mean) | 1.77x [1.61, 1.95] | 1.93x [1.72, 2.18] | 1.93x | **2.34x [1.98, 2.77]** | 2.45x [2.12, 2.86] |
+| total time | 1.75x | 1.93x | 1.92x | 2.30x | 2.37x |
+| tokens/forward | 2.31 | 2.53 | 2.48 | 3.19 | 3.45 |
+
+tree_new vs suffix: 1.21x [1.07, 1.36]. The cache does not help here (tree: 1.05x [0.97, 1.15]; linear: 1.00x): the
+prompts come from different repositories. Per-prompt tree_new speedups range from 0.79x to 7.4x (median 2.1x), and
+unlike code_edit the geometric mean and the total-time ratio agree. Over all five tasks (150 prompts, v4 for the first
+four) the geometric means are 2.10x (suffix), 2.38x (tree_new) and 2.66x (tree_new + cache).
+
+The course sweep also had a "SWE-bench" row (suffix 1.21x, tree-spec 1.30x on L40S). It used the issue text alone as
+the prompt, with no source code to copy from, so the two are not comparable.
+
 ## What moved the needle
 
 1. **Fixing the KV cache bug** (accepted non-first branches kept rejected tokens' KV). Required for correctness; before

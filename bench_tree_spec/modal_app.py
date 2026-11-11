@@ -39,6 +39,8 @@ image = (
     .add_local_dir(REPO_ROOT / "src" / "transformers", "/opt/tf/transformers", ignore=["**/__pycache__"])
 )
 hf_cache = modal.Volume.from_name("llm-bench-hf-cache")
+# SWE-bench prompts carry whole source files: 110 of the 300 Lite prompts fit in 8192 tokens, 7 in 2048
+MAX_PROMPT_TOKENS = {"swebench": 8192}
 app = modal.App("tree-spec-bench", image=image)
 
 
@@ -105,6 +107,11 @@ def _load_prompts(task: str, n: int, tokenizer, seed: int = 0, offset: int = 0) 
     elif task == "chat":
         ds = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train").shuffle(seed=seed)
         msgs = [row["prompt"][0] for row in ds]
+    elif task == "swebench":
+        # issue + the source files the reference patch touches + a request for a patch; latency only, the generated
+        # patches are not applied or scored
+        ds = load_dataset("princeton-nlp/SWE-bench_Lite_oracle", split="test").shuffle(seed=seed)
+        msgs = [row["text"] for row in ds]
     else:
         raise ValueError(task)
 
@@ -114,7 +121,7 @@ def _load_prompts(task: str, n: int, tokenizer, seed: int = 0, offset: int = 0) 
             [{"role": "user", "content": msg}], tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
         # keep prompts reasonably short so one container finishes in bounded time
-        if len(tokenizer(text).input_ids) <= 2048:
+        if len(tokenizer(text).input_ids) <= MAX_PROMPT_TOKENS.get(task, 2048):
             prompts.append(text)
         if len(prompts) == offset + n:
             break
