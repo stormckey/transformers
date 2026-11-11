@@ -77,20 +77,11 @@ def _methods():
     # `<method>_fold`: same kwargs, but masked GQA attention folds query heads instead of repeating K/V
     for name in list(methods):
         methods[f"{name}_fold"] = methods[name]
-    # cross-request variants: one persistent cache per method, shared across the prompts of a task
-    caches = {
-        "suffix_global": SuffixDecodingCache(max_depth=64, max_cached_requests=64),
-        "tree_global_b4_n32": SuffixDecodingCache(max_depth=64, max_cached_requests=64),
-    }
-    methods["suffix_global"] = lambda: {
-        "suffix_decoding_num_tokens": 32,
-        "suffix_decoding_cache": caches["suffix_global"],
-    }
-    methods["tree_global_b4_n32"] = lambda: {
-        "tree_spec_decoding_num_tokens": 32,
-        "tree_spec_decoding_branch_factor": 4,
-        "tree_spec_decoding_cache": caches["tree_global_b4_n32"],
-    }
+    # cross-request variants: one persistent cache per method, shared by the prompts of a task in arrival order, so
+    # prompt i can draft from the responses to prompts 0 .. i-1
+    caches = {name: SuffixDecodingCache(max_depth=64, max_cached_requests=64) for name in ("suffix", "tree_new")}
+    methods["suffix_shared"] = lambda: {**methods["suffix"](), "suffix_decoding_cache": caches["suffix"]}
+    methods["tree_new_shared"] = lambda: {**methods["tree_new"](), "tree_spec_decoding_cache": caches["tree_new"]}
     return methods
 
 
@@ -232,7 +223,7 @@ def run_task(task: str, n: int, model_id: str, max_new_tokens: int, method_names
     # warmup: CUDA context, kernels autotuning, allocator
     warm_prompt = _load_prompts("chat", 1, tokenizer, seed=123)[0]
     for name in names:
-        if "global" not in name:
+        if "shared" not in name:  # keep the warmup prompt out of the cross-request caches
             run_one(warm_prompt, name)
 
     records = []
