@@ -121,10 +121,14 @@ brackets from the log of a container with a slower host):
 - The speculative paths in this fork are **not** compiled. Compiled vanilla decoding reached 99 to 110 tok/s (one
   336-token prompt, 256 new tokens). The eager speculative methods in v3 are still ahead of that on code_edit
   (238 to 292 tok/s) and behind on the other three tasks (53 to 72 tok/s).
-- Projection for a compiled verification forward, from tokens/forward above, the compiled forward times and 1.5 ms
-  of host work per step: tree_new 4.9x on code_edit, 1.4x on humaneval, 1.2x on gsm8k, 0.85x on chat, relative to
-  compiled vanilla decoding. This is an estimate, not a measurement; it needs static-cache support in the tree
-  verifier (in-place KV compaction, fixed mask width, bucketed draft sizes).
+- Projection for a compiled verification forward: tokens/forward above x vanilla time per token / (12.7 ms verify
+  forward + 1.5 ms of host work per step). With vanilla at 9.1 ms/token (end-to-end compiled `generate`): tree_new
+  4.9x on code_edit, 1.4x on humaneval, 1.2x on gsm8k, 0.85x on chat. That mixes two harnesses: the isolated forward
+  benchmark carries overhead that `generate` does not (one token costs 11.1 ms there). With 11.1 ms as the vanilla
+  step the same formula gives 6.0x / 1.7x / 1.4x / 1.03x. So a speculative step would cost 1.3 to 1.6 vanilla steps
+  (1.2 in eager mode), and chat, at 1.32 tokens/forward, ends between a loss and break-even. These are estimates,
+  not measurements; a measurement needs static-cache support in the tree verifier (in-place KV compaction, fixed
+  mask width, bucketed draft sizes).
 
 ## Where the remaining time goes
 
